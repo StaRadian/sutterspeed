@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "Sutterspeed") (type "KiCad") (uri "${KIPRJMOD}/librarys/footprints/sutterspeed.pretty") (options "") (descr ""))
+)
