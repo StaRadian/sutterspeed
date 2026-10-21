@@ -1,0 +1,12 @@
+[submodule "firmware/lib/cmsis-core"]
+	path = firmware/lib/cmsis-core
+	url = https://github.com/STMicroelectronics/cmsis-core.git
+[submodule "firmware/lib/cmsis-device-c0"]
+	path = firmware/lib/cmsis-device-c0
+	url = https://github.com/STMicroelectronics/cmsis-device-c0.git
+[submodule "firmware/lib/stm32c0xx-hal-driver"]
+	path = firmware/lib/stm32c0xx-hal-driver
+	url = https://github.com/STMicroelectronics/stm32c0xx-hal-driver.git
+[submodule "firmware/lib/tinyusb"]
+	path = firmware/lib/tinyusb
+	url = https://github.com/hathach/tinyusb.git

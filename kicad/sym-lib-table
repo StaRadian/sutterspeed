@@ -1,4 +1,0 @@
-(sym_lib_table
-	(version 7)
-	(lib (name "Sutterspeed") (type "KiCad") (uri "${KIPRJMOD}/librarys/symbols/Sutterspeed.kicad_sym") (options "") (descr ""))
-)

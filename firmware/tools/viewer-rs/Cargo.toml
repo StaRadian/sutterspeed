@@ -1,0 +1,16 @@
+[package]
+name = "sutterspeed-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"] }
+egui_plot = "0.37"
+nusb = "0.1"
+rfd = "0.17.2"
+serialport = "4.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

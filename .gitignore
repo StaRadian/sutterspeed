@@ -1,0 +1,26 @@
+# build output
+firmware/build/
+firmware/tools/viewer-rs/target/
+*.exe
+*.obj
+*.pdb
+firmware/test/cl.log
+firmware/test/stub/*_ut.c
+
+# files the viewer writes next to itself
+firmware/tools/sutterspeed_last_pulse.txt
+sutterspeed_scope_*.csv
+sutterspeed_pulses_*.csv
+
+# KiCad local state and automatic backups
+*-backups/
+kicad/.history/
+kicad/production/backups/
+*.kicad_prl
+fp-info-cache
+*.lck
+
+# earlier designs and tools, kept locally only
+_archive/
+firmware/tools/viewer.py
+firmware/test/legacy_shutter/

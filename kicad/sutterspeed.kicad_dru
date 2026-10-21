@@ -1,0 +1,45 @@
+(version 1)
+
+# JLCPCB 4-layer limits that the board-wide minimums in Board Setup cannot express.
+# Source: https://jlcpcb.com/capabilities/pcb-capabilities
+
+(rule "JLC pad to track 0.1mm"
+	(constraint clearance (min 0.1mm))
+	(condition "A.Type == 'Pad' && B.Type == 'Track'"))
+
+(rule "JLC pad hole to pad hole 0.45mm"
+	(constraint hole_to_hole (min 0.45mm))
+	(condition "A.Type == 'Pad' && B.Type == 'Pad'"))
+
+(rule "JLC NPTH min hole 0.5mm"
+	(constraint hole_size (min 0.5mm))
+	(condition "A.Type == 'Pad' && !A.isPlated()"))
+
+(rule "JLC inner layer PTH hole to copper 0.3mm"
+	(constraint hole_clearance (min 0.3mm))
+	(condition "A.Type == 'Pad' && A.isPlated() && (B.Layer == 'In1.Cu' || B.Layer == 'In2.Cu')"))
+
+(rule "JLC inner layer via hole to copper 0.2mm"
+	(constraint hole_clearance (min 0.2mm))
+	(layer inner))
+
+# --- design-intent checks (not JLC limits) ---
+
+# no vias in/overlapping SMD pads (solder wicking / 0402 tombstoning); physical_clearance ignores nets
+(rule "No via in SMD pad"
+	(severity error)
+	(constraint physical_clearance (min 0.1mm))
+	(condition "A.Type == 'Via' && B.Type == 'Pad' && B.Pad_Type == 'SMD'"))
+
+# photodiode -> TIA input incl. feedback branch to R5/C7: keep it short (most noise-sensitive node)
+(rule "TIA input short"
+	(severity error)
+	(constraint length (max 8mm))
+	(condition "A.NetName == 'Net-(D1-K)'"))
+
+# footprint silk that meets the board edge on purpose: J1 = USB-C edge connector guard silk (protects the plug's
+# ground fingers), U2 = SOT-23 pin-1 marker at the top edge. JLC clips silk at the edge anyway.
+(rule "Footprint silk at board edge (accepted)"
+	(constraint silk_clearance (min 0mm))
+	(severity ignore)
+	(condition "(A.Layer == 'F.Silkscreen' || A.Layer == 'B.Silkscreen') && (A.memberOfFootprint('J1') || A.memberOfFootprint('U2'))"))
