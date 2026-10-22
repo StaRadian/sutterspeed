@@ -16,7 +16,6 @@
 #define PULSE_PRE   (PULSE_WIN / 4)                        /* rising window: samples before the trigger */
 #define PULSE_TAIL  (PULSE_WIN / 4)                        /* falling window: samples after the end */
 #define PULSE_END_N 40U                                    /* net samples below the level that end a pulse (100 us) */
-#define PULSE_SMOOTH 2U                                    /* trigger / end decide on y += (x - y) / 4 (10 us) */
 
 enum { SCOPE_AUTO, SCOPE_NORMAL, SCOPE_SINGLE, SCOPE_FREE };   /* FREE: no trigger, a new frame as soon as possible */
 
@@ -31,6 +30,7 @@ typedef struct {
   bool pulse;          /* pulse measurement: full rate, edge windows + envelope, any length */
   uint32_t maxp_ms;    /* pulse mode: longer "pulses" are dropped as a change of the ambient light */
   uint8_t tfk;         /* trigger filter: the level is compared with an average y += (x - y) / 2^tfk (0 = off) */
+  uint32_t minw;       /* minimum width in samples: a crossing that goes back sooner is no trigger (0, 1 = off) */
 } scope_cfg_t;
 
 typedef struct {       /* a finished pulse, valid until scope_frame_done() */
@@ -54,6 +54,7 @@ void scope_process(const uint16_t *scans, uint32_t n);   /* DMA interrupt */
 void scope_poll(uint32_t now_ms);          /* auto-trigger timeout */
 bool scope_frame(const int16_t **buf, uint32_t *start, uint32_t *n, bool *forced);   /* normal frame (ring) */
 bool scope_pulse(scope_pulse_t *p);
+uint32_t scope_trig_extra(void);           /* samples the record ran on while a trigger qualified past `post` */
 void scope_frame_sent(uint32_t count);     /* main loop: this many samples (oldest first) are out: may be reused */
 void scope_frame_done(uint32_t now_ms);    /* frame shipped: re-arm (unless single) */
 uint32_t scope_roll_avail(void);

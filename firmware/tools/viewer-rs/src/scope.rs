@@ -6,11 +6,16 @@ use eframe::egui;
 use egui::{Color32, RichText};
 use egui_plot::{GridInput, GridMark, HLine, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, Points, Text, VLine};
 use crate::icons::{edge_button, pulse_button, run_button};
-use crate::knob::{knob, knob_small, SI_LUX, SI_RATE, SI_TIME};
+use crate::knob::{knob_small_zero, knob, knob_small, SI_LUX, SI_RATE, SI_TIME};
 use crate::pulse::PulseView;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// minimum trigger width steps for the wheel (0 = off)
+const MINW_STEPS: [f64; 10] = [0.0, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3];
+const MINW_MAX: f64 = 2.5e-3;
+/// shutter trigger: two stages of y += (x - y) / 8, about 40 us; room-light flicker of tens of kHz is gone
+const PULSE_AVG_K: u32 = 3;
 const N_MAX: f64 = 4000.0; // firmware SCOPE_NMAX
 const RATE_STEPS: [f64; 13] = [100.0, 200.0, 500.0, 1e3, 2e3, 5e3, 10e3, 20e3, 50e3, 100e3, 200e3, 400e3, 400e3];
 const SCAN_S: f64 = 2.5e-6; // one ADC scan
@@ -26,7 +31,8 @@ const TDIV: [f64; 18] = [
 ];
 const MA_STEPS: [f64; 10] = [2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
 const LP_STEPS: [f64; 14] = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1e3, 2e3, 5e3, 10e3, 20e3];
-const ROLL_FROM: f64 = 0.2; // trigger off: screens this long and longer (20 ms/div up) roll live, shorter ones free-run
+const ROLL_FROM: f64 = 0.2; // screens this long and longer (20 ms/div up) roll live without a trigger; shorter ones
+                            // free-run or trigger
 const STREAM_DEC_MIN: u32 = 4; // the live stream goes up to 100 kS/s (USB)
 const LIVE_MAX_PTS: f64 = 20000.0; // live display: samples per screen at most
 const YDIV: [f64; 22] = [
@@ -214,6 +220,16 @@ fn nice_div(x: f64) -> f64 {
     *YDIV.iter().find(|&&d| d >= x).unwrap_or(&YDIV[YDIV.len() - 1])
 }
 
+/// a screen kept as it was: samples (time from the trigger, filtered, raw) and the time range shown
+#[derive(Clone)]
+struct Frozen {
+    t: Vec<f64>,
+    v: Vec<f64>,
+    raw: Vec<f64>,
+    x0: f64,
+    x1: f64,
+}
+
 pub(crate) fn div_marks(input: GridInput, div: f64, origin: f64) -> Vec<GridMark> {
     let (a, b) = input.bounds;
     if div <= 0.0 || !(b > a) || (b - a) / div > 200.0 {
@@ -263,8 +279,9 @@ pub struct ScopeView {
     y_target: Option<(f64, f64)>,
     y_fast_until: Option<Instant>, // quick glide after a click back to auto
     trig_lag: f64, // samples the board's trigger filter lags behind
-    pulse_rearm: bool,
-    lvl_show_until: Option<Instant>, // trigger off: level line shown briefly after a change
+    lvl_show_until: Option<Instant>,
+    frozen: Option<Frozen>,
+    min_w: f64, // trigger only on light that stays past the level this long (s); 0 = off // shutter measurement armed from the scope: its last screen, until a pulse arrives // trigger off: level line shown briefly after a change
     roll_key: (bool, u32), // live stream the roll buffer belongs to (roll, scans per sample)
     pulse_prev: Option<(u8, bool)>, // mode and trigger before the shutter measurement // automatic vertical scale: (lx/div, centre) the view glides to
     level_dragging: bool,
@@ -315,7 +332,8 @@ impl ScopeView {
             trig_lag: 0.0,
             roll_key: (false, 0),
             lvl_show_until: None,
-            pulse_rearm: false,
+            frozen: None,
+            min_w: 0.0,
             pulse_prev: None,
             level_dragging: false,
             pos_dragging: false,
@@ -335,7 +353,22 @@ impl ScopeView {
         if self.pulse_mode {
             return false;
         }
-        !self.trig_on && self.window() >= ROLL_FROM
+        !self.trig_possible()
+    }
+
+    /// the trigger works up to 10 ms/div; slower time bases roll live
+    fn trig_possible(&self) -> bool {
+        self.window() < ROLL_FROM
+    }
+
+    /// Trigger ON in the roll range (the time base was turned there): switch it off, back to AUTO.
+    fn drop_trigger_if_rolling(&mut self, out: &mut Vec<String>) {
+        if self.trig_on && !self.pulse_mode && !self.trig_possible() {
+            self.trig_on = false;
+            self.mode = 0;
+            self.running = true;
+            self.apply(out);
+        }
     }
     /// (scans per sample, samples captured after the trigger, sample interval)
     fn geom(&self) -> (u32, u32, f64) {
@@ -377,12 +410,20 @@ impl ScopeView {
         // the board's trigger filter fires 2^k - 1 samples after the real crossing: end the record that much
         // earlier, so it still covers the screen once the viewer moves the trigger back onto the crossing
         let post = post.saturating_sub((1u32 << self.trig_filter_k()) - 1);
+        let trig = (self.trig_on && self.trig_possible()) || self.pulse_mode; // the shutter measurement always triggers
+        // minimum width in samples of the capture (2.5 us in the shutter measurement)
+        let minw = if trig && self.min_w > 0.0 {
+            let dt = if self.pulse_mode { SCAN_S } else { self.geom().2 };
+            ((self.min_w / dt).ceil() as u32).clamp(2, if self.pulse_mode { 1000 } else { 100_000 })
+        } else {
+            0
+        };
         format!(
-            "scope set {dec} {} {post} {} {} {} {} {} {} {}",
+            "scope set {dec} {} {post} {} {} {} {} {} {} {} {minw}",
             self.n_eff().round() as u32,
-            if self.trig_on { (self.level_lx * self.cpl).round() as i64 } else { 0 }, // free run ignores them
-            if self.falling && self.trig_on && !self.pulse_mode { 'f' } else { 'r' }, // shutter: a bright pulse
-            if self.trig_on { ['a', 'n', 's'][self.mode as usize] } else { 'f' }, // f: free run (no trigger)
+            if trig { (self.level_lx * self.cpl).round() as i64 } else { 0 }, // free run ignores them
+            if self.falling && trig && !self.pulse_mode { 'f' } else { 'r' }, // shutter: a bright pulse
+            if trig { ['a', 'n', 's'][self.mode as usize] } else { 'f' }, // f: free run (no trigger)
             (self.is_roll() && !self.pulse_mode) as u8,
             self.pulse_mode as u8,
             (self.maxp_s * 1000.0).round() as u32,
@@ -393,8 +434,11 @@ impl ScopeView {
     /// Board-side trigger smoothing (y += (x - y) / 2^k) that matches the screen filter, so the trigger
     /// fires on the filtered trace. 0 = raw.
     fn trig_filter_k(&self) -> u32 {
-        if !self.trig_on || self.pulse_mode || self.is_roll() {
+        if !(self.trig_on || self.pulse_mode) || self.is_roll() {
             return 0;
+        }
+        if self.pulse_mode && self.filt == 0 {
+            return PULSE_AVG_K; // the shutter trigger always looks at a short average (what the screen shows)
         }
         let dt = self.geom().2;
         let a = match self.filt {
@@ -405,7 +449,9 @@ impl ScopeView {
         if !(a > 0.0) {
             return 0;
         }
-        (1.0 / a).log2().round().clamp(0.0, 15.0) as u32
+        let k = (1.0 / a).log2().round().clamp(0.0, 15.0) as u32;
+        // shutter: the average's delay (2 x 2^k samples) must stay inside the 436 samples kept before the trigger
+        if self.pulse_mode { k.clamp(PULSE_AVG_K, 7) } else { k }
     }
 
     /// Commands to (re)start the scope after connecting or switching to the scope view.
@@ -454,12 +500,8 @@ impl ScopeView {
     pub fn on_line(&mut self, ln: &str) -> bool {
         self.pulse.set_filter((self.filt, self.ma_n, self.lp_hz));
         if self.pulse.on_line(ln) {
-            if ln.starts_with("#PEND") {
-                if self.pulse.take_rearm() {
-                    self.pulse_rearm = true; // a noise trigger: wait for the real pulse
-                } else if self.mode == 2 {
-                    self.running = false;
-                }
+            if ln.starts_with("#PEND") && self.mode == 2 {
+                self.running = false;
             }
             return true;
         }
@@ -658,16 +700,23 @@ impl ScopeView {
 
     pub fn controls(&mut self, ui: &mut egui::Ui, connected: bool) -> Vec<String> {
         let mut out = Vec::new();
+        self.drop_trigger_if_rolling(&mut out);
         ui.add_space(4.0);
         ui.add_enabled_ui(connected, |ui| {
             ui.horizontal(|ui| {
                 let run_click = run_button(ui, self.running, connected).clicked();
                 if run_click && self.pulse_mode {
-                    self.running = !self.running; // shutter mode: arm the next pulse / stop waiting
                     if self.running {
-                        self.apply_force(&mut out);
-                    } else {
+                        self.running = false; // stop waiting, the last result stays
                         out.push("scope stop".into());
+                    } else {
+                        // like after SINGLE: run goes back to the running scope (AUTO)
+                        let (_, t) = self.pulse_prev.take().unwrap_or((0, false));
+                        self.pulse_mode = false;
+                        self.mode = 0;
+                        self.trig_on = t;
+                        self.running = true;
+                        self.apply_force(&mut out);
                     }
                 } else if run_click {
                     self.running = !self.running;
@@ -681,19 +730,19 @@ impl ScopeView {
                 // trigger mode: the current one is lit
                 for (m, txt, hint) in [
                     (0u8, "AUTO", "Refreshes even without a trigger"),
-                    (1u8, "NORMAL", "Refreshes only on a trigger (turns the trigger on)"),
-                    (2u8, "SINGLE", "Captures one trigger, then stops (turns the trigger on)"),
+                    (1u8, "NORMAL", "Refreshes only on a trigger"),
+                    (2u8, "SINGLE", "Captures one trigger, then stops"),
                 ] {
-                    let on = self.mode == m && !self.pulse_mode;
+                    // NORMAL and SINGLE wait for a trigger: with the trigger off only AUTO (free running) is there
+                    let usable = m == 0 || self.trig_on || self.pulse_mode;
+                    let on = if self.pulse_mode { m == 2 } else { self.mode == m };
                     let b = egui::Button::new(RichText::new(txt).strong().color(if on { Color32::WHITE } else { Color32::from_gray(200) }))
                         .fill(if on { TRIG } else { Color32::from_gray(55) })
                         .min_size(egui::vec2(64.0, 30.0));
-                    if ui.add(b).on_hover_text(hint).clicked() {
+                    let r = ui.add_enabled(usable, b).on_hover_text(hint).on_disabled_hover_text(format!("{hint}\n(turn the trigger on first)"));
+                    if r.clicked() {
                         self.pulse_mode = false;
                         self.mode = m;
-                        if m > 0 {
-                            self.trig_on = true; // NORMAL / SINGLE need the trigger
-                        }
                         self.running = true;
                         if m == 2 { self.apply_force(&mut out) } else { self.apply(&mut out) }
                     }
@@ -859,11 +908,26 @@ impl ScopeView {
                     ui.label(RichText::new("TRIGGER").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (txt, fill) = if self.trig_on { ("ON", TRIG) } else { ("OFF", Color32::from_gray(70)) };
-                    if ui.add(egui::Button::new(RichText::new(txt).strong().color(Color32::WHITE)).fill(fill).min_size(egui::vec2(44.0, 20.0)))
-                        .on_hover_text("ON: the trace is held on the trigger\nOFF: free running (long time bases roll live)")
+                    let b = egui::Button::new(RichText::new(txt).strong().color(Color32::WHITE)).fill(fill).min_size(egui::vec2(44.0, 20.0));
+                    if ui
+                        .add_enabled(self.trig_possible() || self.pulse_mode, b)
+                        .on_hover_text("ON: the trace is held on the trigger\nOFF: free running")
+                        .on_disabled_hover_text("No trigger at 20 ms/div and slower: the trace rolls live\n(10 ms/div or faster for the trigger)")
                         .clicked()
                     {
-                        self.trig_on = !self.trig_on;
+                        if self.pulse_mode {
+                            // OFF ends the shutter measurement (it cannot run without its trigger)
+                            self.pulse_prev = None;
+                            self.pulse_mode = false;
+                            self.trig_on = false;
+                            self.running = true;
+                        } else {
+                            self.trig_on = !self.trig_on;
+                        }
+                        if !self.trig_on {
+                            self.mode = 0; // without a trigger only AUTO (free running) makes sense
+                            self.running = true;
+                        }
                     }
                     });
                 });
@@ -911,25 +975,19 @@ impl ScopeView {
                         }
                         // shutter measurement: one pulse, single shot
                         if pulse_button(ui, self.pulse_mode, TRIG).clicked() {
-                            if self.pulse_mode {
-                                // leave: back to what it was before
-                                let (m, t) = self.pulse_prev.take().unwrap_or((0, false));
-                                self.pulse_mode = false;
-                                self.mode = m;
-                                self.trig_on = t;
-                            } else {
-                                // the pulse must clearly stand out of the room light (noise, flicker)
-                                if let Some(m) = self.measured() {
-                                    if self.level_lx <= m.max {
-                                        self.level_lx = (m.max * 1.5).max(m.mean + 50.0).round();
-                                    }
-                                }
+                            if !self.pulse_mode {
+                                // keep the scope screen standing (dim) until the pulse comes, like SINGLE
+                                let (t, v, raw) = self.visible3();
+                                let w = self.window();
+                                let (x0, x1) = if self.is_roll() { (-w, 0.0) } else { (self.delay - w / 2.0, self.delay + w / 2.0) };
+                                self.frozen = Some(Frozen { t, v, raw, x0, x1 });
                                 self.pulse_prev = Some((self.mode, self.trig_on));
                                 self.pulse_mode = true;
                                 self.trig_on = true;
                                 self.mode = 2;
                             }
                             self.running = true;
+                            self.pulse.stale = true; // the result shown is from before: dim until the next one
                             pulse_arm = true;
                         }
                     });
@@ -1018,7 +1076,32 @@ impl ScopeView {
                 ui.checkbox(&mut self.show_raw, "Show raw (dim)");
             }
             });
+            // trigger minimum width: light that goes back across the level sooner is passed over
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                let k = knob_small_zero(ui, "minw", "MIN WIDTH", self.min_w, "s", SI_TIME, TRIG, true,
+                    "Trigger only on light that stays past the level at least this long:\nshorter flashes and flicker are passed over\nTurn / wheel: adjust, click: off (HOLDOFF), click the value: type it",
+                    "HOLDOFF");
+                if k.turn != 0.0 {
+                    self.min_w = if self.min_w == 0.0 { if k.turn > 0.0 { 10e-6 } else { 0.0 } } else { self.min_w * 2f64.powf(k.turn / 16.0) };
+                    if self.min_w < 2.5e-6 {
+                        self.min_w = 0.0;
+                    }
+                }
+                if k.wheel != 0 {
+                    let i = MINW_STEPS.iter().position(|&s| s >= self.min_w * 0.999).unwrap_or(MINW_STEPS.len() - 1) as i32;
+                    self.min_w = MINW_STEPS[(i + k.wheel).clamp(0, MINW_STEPS.len() as i32 - 1) as usize];
+                }
+                if k.clicked {
+                    self.min_w = 0.0;
+                }
+                if let Some(v) = k.typed.filter(|v| *v >= 0.0) {
+                    self.min_w = v;
+                }
+                self.min_w = self.min_w.clamp(0.0, MINW_MAX);
+            });
         });
+        // filter (trigger filter) and minimum width go to the board when they change
+        self.apply(&mut out);
         ui.separator();
 
         out
@@ -1133,60 +1216,6 @@ impl ScopeView {
         out
     }
 
-    #[allow(dead_code)] // pulse measurement is hidden in the UI for now
-    fn pulse_controls(&mut self, ui: &mut egui::Ui, out: &mut Vec<String>) {
-        ui.label(RichText::new("TRIGGER (pulse start)").strong());
-        let before = (self.level_lx, self.falling, self.mode, self.maxp_s);
-        let mut lvl_commit = false;
-        let mut lvl_active = false;
-        ui.horizontal(|ui| {
-            let k = knob_small(ui, "plvl", "LEVEL", self.level_lx, "lx", SI_LUX, TRIG, true, "Turn / wheel: a pulse starts above this level\nClick: current level + 30 %");
-            let t = k.turn + 2.0 * k.wheel as f64;
-            if t != 0.0 {
-                self.level_lx *= 2f64.powf(t / 24.0);
-                self.level_lx = (self.level_lx * 100.0).round() / 100.0;
-            }
-            if k.clicked {
-                if let Some(m) = self.measured() {
-                    self.level_lx = ((m.mean * 1.3).max(m.max) * 10.0).round() / 10.0;
-                }
-            }
-            if let Some(v) = k.typed {
-                self.level_lx = v;
-            }
-            lvl_active = k.active;
-            lvl_commit = k.released || k.clicked || k.typed.is_some() || k.wheel != 0;
-            ui.vertical(|ui| {
-                ui.radio_value(&mut self.falling, false, "Bright pulse (shutter)").on_hover_text("Light that goes up, then down");
-                ui.radio_value(&mut self.falling, true, "Dark pulse").on_hover_text("A shadow: down, then up");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.mode, 1, "Repeat");
-                    ui.radio_value(&mut self.mode, 2, "Once");
-                });
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Max length");
-            ui.add(egui::DragValue::new(&mut self.maxp_s).range(0.01..=3600.0).speed(0.5).suffix(" s").max_decimals(2))
-                .on_hover_text("Longer light is taken as a change of the room light and dropped");
-        });
-        ui.label(RichText::new("Opening and closing are recorded at 2.5 us whatever the pulse length").small().weak());
-        if self.mode == 0 {
-            self.mode = 1;
-        }
-        let changed = (self.level_lx, self.falling, self.mode, self.maxp_s) != before && !lvl_active;
-        if changed || lvl_commit {
-            if self.mode == 2 && (self.mode, self.falling) != (before.2, before.1) {
-                self.running = true;
-                self.apply_force(out);
-            } else {
-                self.apply(out);
-            }
-        }
-        ui.separator();
-        self.pulse.panel(ui);
-    }
-
     fn export(&mut self, t: &[f64], v: &[f64]) {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
@@ -1205,25 +1234,37 @@ impl ScopeView {
 
     pub fn plot(&mut self, ui: &mut egui::Ui) -> Vec<String> {
         let mut out = Vec::new();
-        if self.pulse_mode {
+        self.drop_trigger_if_rolling(&mut out);
+        if !self.pulse_mode || !self.pulse.stale {
+            self.frozen = None;
+        }
+        if self.pulse_mode && self.frozen.is_none() {
             self.pulse.set_filter((self.filt, self.ma_n, self.lp_hz));
-            if std::mem::take(&mut self.pulse_rearm) && self.running {
-                self.apply_force(&mut out);
-            }
             // same vertical scale as the scope view (no rescaling)
             let (y0, y1) = (self.yoff - 4.0 * self.ydiv_v, self.yoff + 4.0 * self.ydiv_v);
             let gdiv = match (self.auto_y, self.y_target) {
                 (true, Some((td, _))) => td,
                 _ => self.ydiv_v,
             };
-            self.pulse.plot(ui, self.running, self.level_lx, (y0, y1, gdiv));
+            self.pulse.plot(ui, self.running, self.level_lx, self.filt != 0, (y0, y1, gdiv));
             return out;
         }
         let w = self.window();
         let tdiv = self.tdiv();
         let (unit, uname) = if tdiv < 1e-3 { (1e6, "us") } else if tdiv < 1.0 { (1e3, "ms") } else { (1.0, "s") };
-        let (x0, x1) = if self.is_roll() { (-w, 0.0) } else { (self.delay - w / 2.0, self.delay + w / 2.0) };
-        let (t, v, raw) = self.visible3();
+        let frozen = self.frozen.clone();
+        let (x0, x1) = match &frozen {
+            Some(f) => (f.x0, f.x1),
+            None if self.is_roll() => (-w, 0.0),
+            None => (self.delay - w / 2.0, self.delay + w / 2.0),
+        };
+        let (t, v, raw) = match frozen {
+            Some(f) => (f.t, f.v, f.raw),
+            None => self.visible3(),
+        };
+        // waiting for a trigger (SINGLE armed, or the shutter measurement): the trace on screen is the old one
+        let dim = self.running && (self.pulse_mode || (self.mode == 2 && self.trig_on && !self.is_roll()));
+        let trace = if dim { TRACE.gamma_multiply(0.35) } else { TRACE };
 
         // vertical scale
         let (ydiv, yc) = if self.auto_y || self.auto_ypos {
@@ -1281,7 +1322,9 @@ impl ScopeView {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{}/div", fmt_div(tdiv))).strong().color(TRACE));
             ui.label(RichText::new(format!("{}/div", fmt_lux(gdiv))).strong().color(TRACE));
-            if self.trig_on {
+            if self.pulse_mode {
+                ui.label(RichText::new(format!("WAITING FOR A PULSE  (light above {})", fmt_lux(self.level_lx))).color(TRIG).strong());
+            } else if self.trig_on {
                 ui.label(RichText::new(format!("Trigger {} {}", if self.falling { "↘" } else { "↗" }, fmt_lux(self.level_lx))).color(TRIG));
             }
             ui.label(RichText::new("Wheel: time base · Shift+wheel: scale").small().weak());
@@ -1291,8 +1334,8 @@ impl ScopeView {
         let pts: Vec<[f64; 2]> = minmax_columns(&t, &v, unit, x0, x1, cols);
         let raw_pts: Option<Vec<[f64; 2]>> = (self.filt != 0 && self.show_raw).then(|| minmax_columns(&t, &raw, unit, x0, x1, cols));
         let level = self.level_lx;
-        let roll = self.is_roll();
-        let trig = self.trig_on && !roll;
+        let roll = self.is_roll() && self.frozen.is_none();
+        let trig = (self.trig_on && !roll) || self.pulse_mode;
         // trigger off and the level just changed: show it faintly, fading out
         let lvl_fade = match self.lvl_show_until {
             Some(t) if !self.trig_on => {
@@ -1324,13 +1367,13 @@ impl ScopeView {
             .show(ui, |p| {
                 p.set_plot_bounds(PlotBounds::from_min_max([x0 * unit, y0], [x1 * unit, y1]));
                 if let Some(rp) = raw_pts {
-                    p.line(Line::new("raw", PlotPoints::from(rp)).color(TRACE.gamma_multiply(0.25)).width(1.0));
+                    p.line(Line::new("raw", PlotPoints::from(rp)).color(trace.gamma_multiply(0.25)).width(1.0));
                 }
                 if pts.len() <= 300 {
                     // few samples on screen: show where they really are
-                    p.points(Points::new("samples", PlotPoints::from(pts.clone())).color(TRACE).radius(2.5));
+                    p.points(Points::new("samples", PlotPoints::from(pts.clone())).color(trace).radius(2.5));
                 }
-                p.line(Line::new("light", PlotPoints::from(pts)).color(TRACE).width(1.5));
+                p.line(Line::new("light", PlotPoints::from(pts)).color(trace).width(1.5));
                 if trig {
                     p.hline(HLine::new("trigger", level).color(TRIG).style(LineStyle::dashed_dense()).width(1.5));
                     // level marker at the right edge, like a bench scope

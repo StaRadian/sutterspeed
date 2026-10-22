@@ -37,15 +37,17 @@ Hot code runs from RAM; the hot loops are split into short passes because the M0
 Commands (one per line):
 
 ```
-scope set <dec> <n> <post> <level> <r|f> <a|n|s|f> <roll 0|1> <pulse 0|1> <maxp_ms> <tf>
+scope set <dec> <n> <post> <level> <r|f> <a|n|s|f> <roll 0|1> <pulse 0|1> <maxp_ms> <tf> <minw>
 scope run | scope stop
+adc [scans]    raw channel statistics and stage ratios
 lux [on|off]   raw   zero   gain   dfu   ver   help
 ```
 
 - `dec` scans averaged per sample (1..4096), `n` samples per frame (16..4000), `post` samples after the trigger
   (may exceed `n`: trigger delay), `level` in counts (15.02 per lx), edge, mode (auto / normal / single / free run),
   `roll` streams every sample, `pulse` selects the shutter measurement, `maxp_ms` the longest pulse,
-  `tf` a trigger filter `y += (x - y) / 2^tf`.
+  `tf` a trigger filter `y += (x - y) / 2^tf` (in the shutter measurement two such stages),
+  `minw` the minimum width in samples: a crossing that goes back sooner is no trigger (0 = off).
 - A changed level or edge alone is applied in place, without restarting the capture.
 
 Output:

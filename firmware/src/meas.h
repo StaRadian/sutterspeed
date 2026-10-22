@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define MEAS_SAT 3900     /* raw ADC value treated as saturated */
+#define MEAS_RAIL 16      /* raw ADC value at or below: the stage sits on its lower rail */
 
 typedef struct {
   int32_t o0, o1, o2;     /* dark offsets (raw counts) */
@@ -27,7 +28,18 @@ float meas_level_take(void);   /* live level in lux: brightest 1.28 ms block mea
 void meas_raw(uint16_t raw[3]);
 void meas_zero(void);          /* cover the sensor, then call: learns dark offsets */
 bool meas_zero_busy(void);
-void meas_gains(float g[2]);   /* learned stage-2 / stage-3 gains vs stage 1 */
+void meas_gains(float g[2], bool learned[2]);   /* ratios x11/x1 and x121/x11, and whether each was learned */
+
+/* diagnostic statistics of the raw channels over a number of scans (every 8th is used) */
+typedef struct {
+  uint32_t n;                  /* samples used */
+  uint64_t sum[3], sq[3];
+  uint16_t min[3], max[3];
+  uint32_t rail[3];            /* samples at a rail (<= MEAS_RAIL or >= MEAS_SAT) */
+} meas_stat_t;
+extern meas_stat_t meas_stat;
+void meas_stat_start(uint32_t scans);
+bool meas_stat_busy(void);
 void meas_task(void);          /* main loop: folds the learned gains in */
 
 #endif

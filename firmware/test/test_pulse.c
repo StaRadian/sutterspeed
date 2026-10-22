@@ -19,17 +19,22 @@ static double noise(void) {                       /* ~N(0,1) */
   return s * 1.732;
 }
 
+static double spike;                             /* a 30 us flash of this many lux 5 ms before the pulse */
+
 /* light in lux at time t (s) for a pulse starting at t0 with width w */
 static double light(double t, double t0, double w, double peak, double amb, double tr) {
   double up = 1.0 / (1.0 + exp(-(t - t0) / (tr / 4.4)));
   double dn = 1.0 / (1.0 + exp(-(t - t0 - w) / (tr / 4.4)));
-  return amb * (1.0 + 0.1 * sin(2 * 3.14159265 * 120 * t)) + peak * (up - dn);
+  const double sp = (spike > 0 && t >= t0 - 5e-3 && t < t0 - 5e-3 + 30e-6) ? spike : 0;
+  return amb * (1.0 + 0.1 * sin(2 * 3.14159265 * 120 * t)) + peak * (up - dn) + sp;
 }
 
 static double fe_noise;                          /* front-end noise, lux rms per scan */
+static double ripple, ripple_t;                  /* room-light flicker amplitude (lux) at 44.7 kHz */
 static void scan(uint16_t *s, double lux) {
   const double g[3] = {1, 11, 121};
-  lux += fe_noise * noise();
+  lux += fe_noise * noise() + ripple * sin(2 * 3.14159265 * 44.7e3 * ripple_t);
+  ripple_t += DT_US * 1e-6;
   for (int c = 0; c < 3; c++) {
     double code = VBIAS_COUNTS + lux * COUNTS_PER_LUX / 121.0 * g[c] + 2.0 * noise();
     s[c] = (uint16_t)(code > 4095 ? 4095 : code < 0 ? 0 : code);
@@ -45,10 +50,12 @@ static double cross(const int16_t *a, int n, double lvl, int up) {   /* first ri
   return -1;
 }
 
+static uint8_t tfk;                              /* trigger filter of the runs */
+static uint32_t minw;                            /* minimum width of the runs, samples */
 static int run_lvl(double w, double peak, double amb, double tr, double lvl) {
   static uint16_t blk[DMA_HALF_SCANS * 3];
   scope_cfg_t c = {.dec = 1, .n = 2000, .post = 0, .level = (int32_t)(lvl * COUNTS_PER_LUX),
-                   .mode = SCOPE_SINGLE, .pulse = true, .maxp_ms = 40000};
+                   .mode = SCOPE_SINGLE, .pulse = true, .maxp_ms = 40000, .tfk = tfk, .minw = minw};
   scope_config(&c);
   double t = 0, t0 = 0.01;
   scope_pulse_t p;
@@ -66,7 +73,8 @@ static int run_lvl(double w, double peak, double amb, double tr, double lvl) {
   double r = cross(p.rise, PULSE_WIN, half, 1), f = cross(p.fall, (int)p.fall_n, half, 0);
   double width = ((double)p.fall_start + f - (r - PULSE_PRE)) * DT_US;   /* us */
   double err = width / (w * 1e6) - 1;
-  int bad = r < 0 || f < 0 || fabs(err) > (w < 1e-3 ? 0.02 : 0.002);
+  /* the evaluation here takes raw 2.5 us samples: with noise / flicker a crossing jitters by a sample or so */
+  int bad = r < 0 || f < 0 || fabs(err) > (w < 1e-3 ? 0.02 : fe_noise > 0 ? 0.005 : 0.002);
   printf("  w=%10.1f us  measured %10.1f us  err %+7.3f %%  plateau %.0f lx  env %u x %u  %s\n", w * 1e6, width,
          err * 100, P / COUNTS_PER_LUX, p.env_n, p.env_bucket, bad ? "FAIL" : "ok");
   scope_frame_done(0);
@@ -82,9 +90,24 @@ int main(void) {
   for (unsigned i = 0; i < sizeof ws / sizeof ws[0]; i++) fails += run(ws[i], 2000, 20, 20e-6);
   printf("dim pulse, 100 lx:\n");
   fails += run(4e-3, 100, 20, 20e-6);
-  printf("noisy front end (30 lx rms per scan), 400 lx pulse on 100 lx, level 2 rms above the room light:\n");
+  printf("noisy front end (30 lx rms per scan), 400 lx pulse on 100 lx, level 2 rms above, trigger filter 1/4:\n");
   fe_noise = 30;
+  tfk = 2;
   for (unsigned i = 2; i < 9; i++) fails += run_lvl(ws[i], 400, 100, 20e-6, 160);
+  fe_noise = 0;
+  printf("room light 60 lx flickering +-70 lx at 44.7 kHz, 1000 lx pulse, level 100 lx, 40 us trigger average:\n");
+  ripple = 70;
+  tfk = 3;
+  fe_noise = 15;
+  for (unsigned i = 0; i < 9; i++) fails += run_lvl(ws[i], 1000, 60, 20e-6, 100);
+  printf("same, plus a 30 us flash 5 ms before the pulse: dropped by a 150 us minimum width:\n");
+  spike = 1000;
+  minw = 60;
+  for (unsigned i = 1; i < 9; i++) fails += run_lvl(ws[i], 1000, 60, 20e-6, 100);
+  spike = 0;
+  minw = 0;
+  ripple = 0;
+  tfk = 0;
   fe_noise = 0;
   printf("very bright, 20 klx (only stage 1 in range):\n");
   fails += run(4e-3, 20000, 20, 20e-6);
@@ -135,6 +158,31 @@ int main(void) {
     }
     printf("  dec %4d: %s\n", d, bad ? "FAIL" : "ok");
     fails += bad;
+    scope_frame_done(0);
+  }
+  printf("scope trigger with a minimum width: a 3-sample spike is passed over, the step after it triggers:\n");
+  {
+    static uint16_t blk[DMA_HALF_SCANS * 3];
+    scope_cfg_t c = {.dec = 1, .n = 64, .post = 32, .level = 500, .mode = SCOPE_NORMAL, .maxp_ms = 40000, .minw = 10};
+    scope_config(&c);
+    const int16_t *b;
+    uint32_t st0, n, scan = 0;
+    bool forced;
+    int got = 0;
+    while (!got && scan < 20000) {
+      for (uint32_t i = 0; i < DMA_HALF_SCANS; i++, scan++) {   /* stage 3 only: counts = raw - offset */
+        const uint32_t hi = (scan >= 1000 && scan < 1003) || scan >= 3000;
+        blk[3 * i] = blk[3 * i + 1] = VBIAS_COUNTS;
+        blk[3 * i + 2] = (uint16_t)(VBIAS_COUNTS + (hi ? 1000 : 100));
+      }
+      scope_process(blk, DMA_HALF_SCANS);
+      got = scope_frame(&b, &st0, &n, &forced);
+    }
+    /* the trigger sample is n - 1 - post - extra from the oldest one */
+    int tr = (int)n - 1 - 32 - (int)scope_trig_extra();
+    int ok = got && tr > 0 && b[(st0 + tr - 1) % n] < 500 && b[(st0 + tr) % n] >= 500 && b[(st0 + tr + 12) % n] >= 500;
+    printf("  %s\n", ok ? "ok" : "FAIL");
+    fails += !ok;
     scope_frame_done(0);
   }
   printf("%s (%d failures)\n", fails ? "FAILED" : "all ok", fails);

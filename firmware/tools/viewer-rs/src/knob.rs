@@ -25,17 +25,23 @@ const WHEEL_ANGLE: f32 = PI / 6.0; // 30 degrees per wheel notch (drawing only)
 
 #[allow(clippy::too_many_arguments)]
 pub fn knob(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, si: &[(&str, f64)], accent: Color32, enabled: bool, hint: &str) -> KnobOut {
-    knob_sized(ui, id, label, value, unit, si, accent, enabled, hint, false)
+    knob_sized(ui, id, label, value, unit, si, accent, enabled, hint, false, None)
 }
 
 /// smaller knob for the secondary controls (positions, sample count, level)
 #[allow(clippy::too_many_arguments)]
 pub fn knob_small(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, si: &[(&str, f64)], accent: Color32, enabled: bool, hint: &str) -> KnobOut {
-    knob_sized(ui, id, label, value, unit, si, accent, enabled, hint, true)
+    knob_sized(ui, id, label, value, unit, si, accent, enabled, hint, true, None)
+}
+
+/// small knob that shows `zero_text` instead of "0 <unit>" at zero (still clickable to type a value)
+#[allow(clippy::too_many_arguments)]
+pub fn knob_small_zero(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, si: &[(&str, f64)], accent: Color32, enabled: bool, hint: &str, zero_text: &str) -> KnobOut {
+    knob_sized(ui, id, label, value, unit, si, accent, enabled, hint, true, Some(zero_text))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn knob_sized(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, si: &[(&str, f64)], accent: Color32, enabled: bool, hint: &str, small: bool) -> KnobOut {
+fn knob_sized(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, si: &[(&str, f64)], accent: Color32, enabled: bool, hint: &str, small: bool, zero_text: Option<&str>) -> KnobOut {
     let (num, prefix) = si_split(value, si);
     let mut out = KnobOut { turn: 0.0, wheel: 0, clicked: false, released: false, active: false, typed: None };
     let key = egui::Id::new(("knob", id));
@@ -142,11 +148,17 @@ fn knob_sized(ui: &mut egui::Ui, id: &str, label: &str, value: f64, unit: &str, 
                 let mut job = egui::text::LayoutJob::default();
                 let mono = egui::FontId::monospace(11.0);
                 let fg = if enabled { Color32::from_gray(230) } else { Color32::GRAY };
-                job.append(&format!("{num} {prefix}"), 0.0, egui::TextFormat { font_id: mono.clone(), color: fg, underline: Stroke::new(1.0, fg), ..Default::default() });
-                job.append(unit, 0.0, egui::TextFormat { font_id: mono, color: Color32::from_gray(150), ..Default::default() });
+                let zero = zero_text.filter(|_| value == 0.0);
+                match zero {
+                    Some(z) => job.append(z, 0.0, egui::TextFormat { font_id: mono, color: fg, underline: Stroke::new(1.0, fg), ..Default::default() }),
+                    None => {
+                        job.append(&format!("{num} {prefix}"), 0.0, egui::TextFormat { font_id: mono.clone(), color: fg, underline: Stroke::new(1.0, fg), ..Default::default() });
+                        job.append(unit, 0.0, egui::TextFormat { font_id: mono, color: Color32::from_gray(150), ..Default::default() });
+                    }
+                }
                 let r = ui.add(egui::Label::new(job).sense(if enabled { Sense::click() } else { Sense::hover() }));
                 if enabled && r.on_hover_text("Click to type (a number with a prefix like m, u, k. Enter = apply, Esc = cancel)").clicked() {
-                    editing = Some(format!("{num}{prefix}"));
+                    editing = Some(if zero.is_some() { String::new() } else { format!("{num}{prefix}") });
                 }
             }
             if let Some(t) = finish {

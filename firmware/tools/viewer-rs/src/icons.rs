@@ -4,8 +4,8 @@ use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Strok
 
 #[derive(Clone, Copy)]
 pub enum Icon {
-    Plug,     // connect
-    Unplug,   // disconnect
+    Plug,     // connected
+    Unplug,   // not connected
     Zero,     // dark-offset calibration
     Firmware, // firmware update
 }
@@ -108,7 +108,7 @@ pub fn edge_button(ui: &mut egui::Ui, rising: bool, selected: bool, accent: Colo
 /// Shutter measurement: a single light pulse (up, then down); lit while the mode is on
 pub fn pulse_button(ui: &mut egui::Ui, selected: bool, accent: Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 24.0), Sense::click());
-    let resp = resp.on_hover_text("Shutter measurement (on / off)\nmeasures one light pulse and shows it from start to end\n▶ arms the next one");
+    let resp = resp.on_hover_text("Shutter measurement (single)\nwaits for one light pulse and shows it from start to end\nclick again for the next one, ▶ goes back to the running scope");
     let p = ui.painter();
     let hot = resp.hovered();
     let bg = if selected { accent } else if hot { Color32::from_gray(64) } else { Color32::from_gray(48) };

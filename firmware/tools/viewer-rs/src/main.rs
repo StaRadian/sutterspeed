@@ -326,14 +326,20 @@ impl App {
                     self.ctl(Ctl::Connect(self.choice.clone()));
                 }
             }
-            if self.want_conn {
-                if icon_button(ui, Icon::Unplug, "Disconnect", self.tx.is_some(), ORANGE).clicked() {
-                    self.want_conn = false;
+            // the icon shows the link as it is: a plain plug while connected, crossed out while not (also while the
+            // cable is out and it reconnects by itself)
+            let (icon, hint, accent) = match (self.connected.is_some(), self.want_conn) {
+                (true, _) => (Icon::Plug, "Connected\nclick to disconnect", ORANGE),
+                (false, true) => (Icon::Unplug, "Not connected: reconnects when the board is back\nclick to stop", ORANGE),
+                (false, false) => (Icon::Unplug, "Not connected\nclick to connect", GREEN),
+            };
+            if icon_button(ui, icon, hint, self.tx.is_some(), accent).clicked() {
+                self.want_conn = !self.want_conn;
+                if self.want_conn {
+                    self.ctl(Ctl::Connect(self.choice.clone()));
+                } else {
                     self.ctl(Ctl::Disconnect);
                 }
-            } else if icon_button(ui, Icon::Plug, "Connect", self.tx.is_some(), GREEN).clicked() {
-                self.want_conn = true;
-                self.ctl(Ctl::Connect(self.choice.clone()));
             }
             ui.separator();
             let col = if self.connected.is_some() { GREEN } else if self.want_conn { ORANGE } else { Color32::GRAY };

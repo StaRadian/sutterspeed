@@ -10,7 +10,8 @@
 #include "scope.h"
 #include "tusb.h"
 
-#define FW_VERSION "0.3.2"
+#define FW_VERSION "0.3.7"
+#include <math.h>
 
 extern volatile uint32_t acq_overruns, acq_isr_us_max, acq_isr_us_last, acq_isr_calls;
 uint32_t millis(void);
@@ -74,9 +75,9 @@ static void scope_print_cfg(void) {
   scope_cfg_t c;
   bool run;
   scope_get(&c, &run);
-  outf("scope %s dec=%u n=%u post=%lu lvl=%ld edge=%c mode=%c roll=%d pulse=%d maxp=%lu tf=%u\r\n", run ? "run" : "stop",
+  outf("scope %s dec=%u n=%u post=%lu lvl=%ld edge=%c mode=%c roll=%d pulse=%d maxp=%lu tf=%u minw=%lu\r\n", run ? "run" : "stop",
        c.dec, c.n, (unsigned long)c.post, (long)c.level, c.falling ? 'f' : 'r', "ansf"[c.mode], c.roll,
-       c.pulse, (unsigned long)c.maxp_ms, c.tfk);
+       c.pulse, (unsigned long)c.maxp_ms, c.tfk, (unsigned long)c.minw);
 }
 
 /* scope set <dec> <n> <post> <level> <r|f> <a|n|s> <roll 0|1> <pulse 0|1> <maxp_ms> */
@@ -101,9 +102,11 @@ static void cmd_scope(char *arg) {
     if ((t = strtok(NULL, " "))) c.pulse = *t == '1';
     if ((t = strtok(NULL, " "))) c.maxp_ms = (uint32_t)strtoul(t, NULL, 10);
     if ((t = strtok(NULL, " "))) c.tfk = (uint8_t)atoi(t);
+    c.minw = 0;
+    if ((t = strtok(NULL, " "))) c.minw = (uint32_t)strtoul(t, NULL, 10);
     scope_config(&c);
   } else {
-    outs("scope [run|stop|set dec n post level r|f a|n|s|f roll pulse maxp_ms tf]\r\n");
+    outs("scope [run|stop|set dec n post level r|f a|n|s|f roll pulse maxp_ms tf minw]\r\n");
     return;
   }
   scope_print_cfg();
@@ -134,7 +137,7 @@ static void scope_task(void) {
   if (scope_frame(&b, &st0, &n, &forced)) {
     scope_get(&c, &run);
     outf("#SCOPE enc=3 n=%lu dec=%u trig=%ld lvl=%ld forced=%d dt_us=%s cpl=%s\r\n", (unsigned long)n, c.dec,
-         (long)(n - 1) - (long)c.post, (long)c.level, forced, fx(t, DT_US, 3), fx(u, COUNTS_PER_LUX, 2));
+         (long)(n - 1) - (long)c.post - (long)scope_trig_extra(), (long)c.level, forced, fx(t, DT_US, 3), fx(u, COUNTS_PER_LUX, 2));
     hex_lines(b, st0, n, n, true);
     outs("#SEND\r\n");
     scope_frame_done(millis());
@@ -168,6 +171,49 @@ static void scope_task(void) {
   }
 }
 
+/* raw channel statistics: offsets, noise, rails and the stage ratios from the means */
+static void cmd_adc(uint32_t scans) {
+  if (scans < 512) scans = 65536;
+  if (scans > 4000000) scans = 4000000;
+  meas_stat_start(scans);
+  uint32_t t0 = millis();
+  while (meas_stat_busy() && millis() - t0 < 12000) tud_task();
+  const meas_stat_t st = meas_stat;
+  if (!st.n) { outs("adc: no data\r\n"); return; }
+  const int32_t off[3] = {meas_cal.o0, meas_cal.o1, meas_cal.o2};
+  static const char *const name[3] = {"x1  ", "x11 ", "x121"};
+  char a[16], b[16], c[16];
+  float d[3];
+  outf("adc: %lu samples (every 8th of %lu scans, %lu ms)\r\n", (unsigned long)st.n, (unsigned long)(st.n * 8),
+       (unsigned long)(st.n * 8 * 25 / 10000));
+  outs("        mean  -offset      sd   min   max  at rail\r\n");
+  for (int i = 0; i < 3; i++) {
+    const float m = (float)st.sum[i] / (float)st.n;
+    const uint64_t nv = st.sq[i] * st.n - st.sum[i] * st.sum[i];   /* n^2 x variance, exact in integers */
+    const float sd = sqrtf((float)nv) / (float)st.n;
+    d[i] = m - (float)off[i];
+    outf("%s %8s %8s %7s %5u %5u %8lu\r\n", name[i], fx(a, m, 2), fx(b, d[i], 2), fx(c, sd, 1), st.min[i], st.max[i],
+         (unsigned long)st.rail[i]);
+  }
+  /* a ratio needs the less sensitive stage clearly above its offset and the more sensitive one off the rails */
+  for (int i = 0; i < 2; i++) {
+    const char *what = i ? "x121/x11" : "x11/x1  ";
+    const float need = i ? 30.0f : 20.0f;
+    /* a few clipped samples (< 0.1 %) barely move the mean */
+    if (st.rail[i + 1] * 1000 > st.n) {
+      if (st.max[i + 1] >= MEAS_SAT) outf("%s  -  (%s saturates: less light)\r\n", what, name[i + 1]);
+      else outf("%s  -  (%s noise reaches 0 V: more light)\r\n", what, name[i + 1]);
+    }
+    else if (d[i] < need) outf("%s  -  (%s only %s above its offset: more light)\r\n", what, name[i], fx(a, d[i], 1));
+    else outf("%s %s  (nominal 11)\r\n", what, fx(a, d[i + 1] / d[i], 3));
+  }
+  float g[2];
+  bool l[2];
+  meas_gains(g, l);
+  outf("in use: x11/x1 %s (%s)  x121/x11 %s (%s)\r\n", fx(a, g[0], 3), l[0] ? "learned" : "default", fx(b, g[1], 3),
+       l[1] ? "learned" : "default");
+}
+
 static void exec(char *line) {
   char *arg = strchr(line, ' ');
   if (arg) { *arg++ = 0; while (*arg == ' ') arg++; }
@@ -180,6 +226,7 @@ static void exec(char *line) {
          "  raw           raw ADC values (PA0 x1, PA1 x11, PA2 x121)\r\n"
          "  zero          cover the sensor first: learn dark offsets\r\n"
          "  gain          self-calibrated stage gains\r\n"
+         "  adc [scans]   raw channel statistics and stage ratios (default 65536 scans)\r\n"
          "  dfu           reboot into the ST USB DFU bootloader (firmware update)\r\n"
          "  ver           firmware version and interrupt load\r\n");
   } else if (!strcmp(line, "lux")) {
@@ -196,8 +243,12 @@ static void exec(char *line) {
     outf("dark offsets: %ld %ld %ld\r\n", (long)meas_cal.o0, (long)meas_cal.o1, (long)meas_cal.o2);
   } else if (!strcmp(line, "gain")) {
     float g[2];
-    meas_gains(g);
-    outf("stage2 x%s  stage3 x%s  (nominal x11 / x121)\r\n", fx(a, g[0], 3), fx(b, g[1], 2));
+    bool l[2];
+    meas_gains(g, l);
+    outf("x11/x1 %s (%s)  x121/x11 %s (%s)  nominal 11 / 11\r\n", fx(a, g[0], 3), l[0] ? "learned" : "default",
+         fx(b, g[1], 3), l[1] ? "learned" : "default");
+  } else if (!strcmp(line, "adc")) {
+    cmd_adc(arg ? (uint32_t)strtoul(arg, NULL, 10) : 0);
   } else if (!strcmp(line, "scope")) {
     cmd_scope(arg ? arg : (char[]){0});
   } else if (!strcmp(line, "dfu")) {

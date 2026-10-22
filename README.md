@@ -40,12 +40,17 @@ board and pick its COM port.
 
 - **Horizontal**: 10 µs/div .. 5 s/div, position, sample rate (400 kS/s and divisions of it). Long time bases roll live.
 - **Vertical**: lx/div and position, AUTO follows the signal smoothly; drag the trace to move it.
-- **Trigger**: AUTO / NORMAL / SINGLE, rising or falling edge, level knob or drag the ◀ marker.
+- **Trigger** (10 ms/div and faster; slower time bases roll live): AUTO / NORMAL / SINGLE, rising or falling edge,
+  level knob or drag the ◀ marker. While SINGLE waits, the previous trace stays on screen, dimmed.
 - **Filter**: moving average or low-pass on screen; the board triggers on the same filtered signal.
+- **Min width** (next to the filter): light has to stay past the level at least this long to trigger, so short flashes
+  and flicker are passed over. 0 = off (shown as HOLDOFF).
 - **Measurements**: max, min, mean, peak-peak, flicker, frequency, period, width, duty, rise time; cursors A/B.
-- **Shutter measurement** (pulse icon under the trigger): waits for one light pulse and shows it from start to end
-  with the open time (50 % to 50 %), effective time, 10–90 % edges, nearest nominal speed and the error in EV.
-  Pulses from about 100 µs to tens of seconds are captured with 2.5 µs edge resolution.
+- **Shutter measurement** (pulse icon under the trigger, works like SINGLE): waits for one light pulse and shows it
+  from start to end. The open time runs from the light rising through the trigger level to it falling back through it
+  (on the filtered trace when a filter is set), with the nearest nominal speed and the error in EV. The trigger looks
+  at a 40 µs average (or the filter), the timing at the 2.5 µs samples. Pulses from about 100 µs to tens of seconds.
+  ▶ goes back to the running scope.
 - **Firmware update**: the chip icon flashes a `.hex`/`.bin` over USB (ST system bootloader, DfuSe),
   or from a script: `sutterspeed-viewer --flash sutterspeed.hex`.
 
@@ -68,7 +73,9 @@ See [`firmware/README.md`](firmware/README.md) for flashing and the serial proto
 - The lux scale comes from the datasheet (≈10 nA/lx for illuminant A, ≈15 counts per lx) and is not calibrated;
   other light sources (LED, daylight) can read tens of percent off. `zero` removes the dark offset only — cover the
   sensor when using it.
-- The 2.5 µs samples are noisy (tens of lx at room light); slower sample rates and the filters average it out.
-  The shutter measurement decides start and end on a lightly smoothed value and ignores triggers on noise.
+- The 2.5 µs samples are noisy (tens of lx at room light, and LED room light may flicker at tens of kHz);
+  slower sample rates and the filters average it out. Set the shutter trigger level clearly above the room light.
+- Measured on one board: stage ratios ×10.9 (×11 / ×1) and ×13.0 (×121 / ×11, nominal 11); the firmware learns
+  them while running (`adc` and `gain` show them).
 
 Copyright © 2026 StaRadian. All rights reserved. The libraries under `firmware/lib` keep their own licenses.

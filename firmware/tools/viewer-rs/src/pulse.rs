@@ -1,6 +1,7 @@
 //! Pulse measurement view: the firmware captures a light pulse of any length as a rising-edge window, a
-//! falling-edge window (both 2.5 us/sample) and a min/max envelope; here the 50 % crossings are interpolated
-//! to get the open time (shutter speed), plus 10-90 % edges, effective exposure, brightness and statistics.
+//! falling-edge window (both 2.5 us/sample) and a min/max envelope. The open time (shutter speed) is the time
+//! from the light rising through the trigger level to it falling back through it, on the screen filter's output
+//! when a filter is set.
 
 use crate::scope::fmt_time;
 use eframe::egui;
@@ -45,47 +46,21 @@ fn kv(line: &str, key: &str) -> Option<f64> {
     line.split_whitespace().find_map(|t| t.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
 }
 
-/// Crossings of `lvl` (interpolated indices) with hysteresis: a crossing counts only when the signal swings from
-/// beyond `lvl - h` to beyond `lvl + h` (mirrored when falling); its time is the last pass through `lvl` itself
-/// in that swing. Noise smaller than h around the level gives no crossings.
-fn crossings(a: &[f64], lvl: f64, h: f64, up: bool) -> Vec<f64> {
+/// crossings of `lvl` (interpolated indices), upward or downward
+fn crossings(a: &[f64], lvl: f64, up: bool) -> Vec<f64> {
     let s = if up { 1.0 } else { -1.0 };
-    let mut out = Vec::new();
-    let mut armed = a.first().is_some_and(|&x| s * (x - lvl) < -h);
-    let mut last = None;
-    for i in 1..a.len() {
-        let (x0, x1) = (s * (a[i - 1] - lvl), s * (a[i] - lvl));
-        if x1 < -h {
-            armed = true;
-            last = None;
-            continue;
-        }
-        if x0 < 0.0 && x1 >= 0.0 {
-            last = Some((i - 1) as f64 + x0 / (x0 - x1));
-        }
-        if armed && x1 >= h {
-            if let Some(t) = last {
-                out.push(t);
-            }
-            armed = false;
-            last = None;
-        }
-    }
-    out
-}
-
-fn nearest(v: &[f64], t: f64) -> Option<f64> {
-    v.iter().copied().min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
+    (1..a.len())
+        .filter_map(|i| {
+            let (x0, x1) = (s * (a[i - 1] - lvl), s * (a[i] - lvl));
+            (x0 < 0.0 && x1 >= 0.0).then(|| (i - 1) as f64 + x0 / (x0 - x1))
+        })
+        .collect()
 }
 
 #[derive(Clone)]
 pub struct Shot {
     pub seq: u32,
-    pub width: f64, // s, 50 % to 50 %
-    pub teff: f64,  // s, area / plateau
-    pub rise: Option<f64>,
-    pub fall: Option<f64>,
-    pub peak_lx: f64,
+    pub width: f64, // s, rising to falling through the trigger level
     pub nominal: f64,
     pub ev: f64,
     pub clipped: bool,
@@ -97,15 +72,11 @@ pub type Filt = (u8, f64, f64);
 
 struct Capture {
     dt: f64,
-    pre: usize,
+    pre: usize, // index of the trigger sample in the rising window
     fall_start: f64,
     rise_raw: Vec<f64>, // lux, as sampled
     fall_raw: Vec<f64>,
-    mean: f64,
-    plat: f64,
-    count: f64,
-    end: f64, // samples from the trigger to the first dark one
-    why: Option<&'static str>, // why there is no result
+    level: f64, // trigger level, lux
     clipped: bool,
     timeout: bool,
     seq: u32,
@@ -113,10 +84,8 @@ struct Capture {
     fall: Vec<f64>,
     env: Vec<(f64, f64)>,
     env_bucket: f64,
-    base: f64,
-    half: f64,
-    r50: Option<f64>,
-    f50: Option<f64>,
+    t_rise: Option<f64>, // crossing index in `rise`
+    t_fall: Option<f64>, // crossing index in `fall`
     shot: Option<Shot>,
 }
 
@@ -139,85 +108,31 @@ pub struct PulseView {
     seq: u32,
     note: String,
     filt: Filt,
-    /// noise triggers ignored since the last real pulse
-    pub ignored: u32,
-    rearm: bool,
+    /// armed again: what is shown is the previous pulse (drawn dim until the next one)
+    pub stale: bool,
 }
 
 impl Capture {
-    /// Filter the opening / closing and measure them.
-    ///
-    /// The dark level and the noise come from the quiet part before the trigger, the bright level from the lit
-    /// samples (trigger .. end) held in the two windows. The 50 % crossings are taken with a hysteresis of about
-    /// twice the noise, the one nearest the trigger for the opening and nearest the end for the closing, so noise
-    /// around the 50 % level cannot stretch the pulse to the window edges.
+    /// Filter and time the pulse. The board triggers on an average, a little after the light itself passed the
+    /// level: rising = the last upward crossing of the level up to the trigger (earlier ones are flicker around
+    /// the level before the pulse), falling = the first downward crossing after the rising one.
     fn analyze(&mut self, f: Filt) {
         let filt = |x: &[f64]| if f.0 == 0 { x.to_vec() } else { crate::scope::ScopeView::filter_with(f, x, self.dt) };
         let (rise, fall) = (filt(&self.rise_raw), filt(&self.fall_raw));
-        let (dt, pre, fs) = (self.dt, self.pre, self.fall_start);
-        let q = pre.saturating_sub(20).clamp(1, rise.len());
-        let base = rise[..q].iter().sum::<f64>() / q as f64;
-        let noise = (rise[..q].iter().map(|x| (x - base).powi(2)).sum::<f64>() / q as f64).sqrt();
-        let m8: Vec<f64> = rise[..q].chunks_exact(8).map(|c| c.iter().sum::<f64>() / 8.0).collect();
-        let noise8 = if m8.is_empty() { noise } else { (m8.iter().map(|x| (x - base).powi(2)).sum::<f64>() / m8.len() as f64).sqrt() };
-        // lit samples: the rising window after the trigger and the falling window, up to the end of the pulse
-        let end = self.end.max(1.0);
-        let after = rise.len().saturating_sub(pre); // trigger-relative samples the rising window holds
-        let mut lit: Vec<f64> = rise.iter().skip(pre).take((end as usize).min(after)).copied().collect();
-        let k0 = ((after as f64 - fs).max(0.0) as usize).min(fall.len());
-        let k1 = ((end - fs).max(0.0) as usize).min(fall.len());
-        if k1 > k0 {
-            lit.extend_from_slice(&fall[k0..k1]);
-        }
-        lit.sort_by(|a, b| a.total_cmp(b));
-        // bright level: upper quartile of the lit part (the edges pull the median down on short pulses)
-        let plat = if lit.len() >= 8 { lit[lit.len() * 3 / 4] } else { self.plat };
-        let p = plat - base;
-        let half = base + p / 2.0;
-        let h = (2.0 * noise).min(0.25 * p.max(0.0));
-        let r50 = nearest(&crossings(&rise, half, h, true), pre as f64);
-        let f50 = nearest(&crossings(&fall, half, h, false), end - fs);
-        let why = if lit.len() < 8 {
-            Some("Too short: a noise spike, not a pulse")
-        } else if p < 6.0 * noise8.max(0.05) {
-            Some("Too weak against the noise")
-        } else if r50.is_none() || f50.is_none() {
-            Some("Could not find the edges")
-        } else {
-            None
-        };
-        let shot = match (r50, f50, why) {
-            (Some(r), Some(fc), None) => {
-                let width = (fs + fc - (r - pre as f64)) * dt;
-                // 10-90 %: the crossings on each side of the 50 % one
-                let he = (2.0 * noise).min(0.05 * p);
-                let (l10, l90) = (base + 0.1 * p, base + 0.9 * p);
-                let before = |v: Vec<f64>, t: f64| v.into_iter().filter(|&x| x <= t).fold(None, |_, x| Some(x));
-                let after = |v: Vec<f64>, t: f64| v.into_iter().find(|&x| x >= t);
-                let rise_t = before(crossings(&rise, l10, he, true), r).zip(after(crossings(&rise, l90, he, true), r)).map(|(a, b)| (b - a) * dt);
-                let fall_t = before(crossings(&fall, l90, he, false), fc).zip(after(crossings(&fall, l10, he, false), fc)).map(|(a, b)| (b - a) * dt);
+        let (dt, pre, fs) = (self.dt, self.pre as f64, self.fall_start);
+        let up = crossings(&rise, self.level, true);
+        let tr = up.iter().copied().filter(|&t| t <= pre).last().or_else(|| up.first().copied());
+        // falling, in trigger-relative samples: after the rising crossing
+        let tf = tr.and_then(|r| crossings(&fall, self.level, false).into_iter().find(|&t| fs + t > r - pre));
+        let shot = match (tr, tf) {
+            (Some(r), Some(fc)) if fs + fc > r - pre => {
+                let width = (fs + fc - (r - pre)) * dt;
                 let nominal = nearest_nominal(width);
-                Some(Shot {
-                    seq: self.seq,
-                    width,
-                    teff: (self.mean - base) * self.count / p * dt,
-                    rise: rise_t,
-                    fall: fall_t,
-                    peak_lx: p,
-                    nominal,
-                    ev: (width / nominal).log2(),
-                    clipped: self.clipped,
-                    timeout: self.timeout,
-                })
+                Some(Shot { seq: self.seq, width, nominal, ev: (width / nominal).log2(), clipped: self.clipped, timeout: self.timeout })
             }
             _ => None,
         };
-        (self.rise, self.fall, self.base, self.half, self.r50, self.f50, self.why, self.shot) = (rise, fall, base, half, r50, f50, why, shot);
-    }
-
-    /// a trigger on noise rather than on a light pulse
-    fn is_noise(&self) -> bool {
-        self.shot.is_none() && matches!(self.why, Some(w) if w.starts_with("Too"))
+        (self.rise, self.fall, self.t_rise, self.t_fall, self.shot) = (rise, fall, tr, tf, shot);
     }
 }
 
@@ -257,13 +172,10 @@ impl PulseView {
         let dt = kv(h, "dt_us").unwrap_or(2.5) * 1e-6;
         let pre = kv(h, "pre").unwrap_or(0.0) as usize;
         let fall_start = kv(h, "fstart").unwrap_or(0.0);
-        let count = kv(h, "count").unwrap_or(0.0);
-        let mean = kv(h2, "mean").unwrap_or(0.0) / cpl;
-        let plat = kv(h2, "plat").unwrap_or(0.0) / cpl;
+        let level = kv(h2, "lvl").unwrap_or(0.0) / cpl;
         let eb = kv(h2, "eb").unwrap_or(1.0);
         let clipped = kv(h2, "clip").unwrap_or(0.0) != 0.0;
         let timeout = kv(h2, "to").unwrap_or(0.0) != 0.0;
-        let end = kv(h, "end").unwrap_or(0.0);
         // the last capture as received, for checking the measurement by hand
         if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
             let _ = std::fs::write(dir.join("sutterspeed_last_pulse.txt"), r.lines.join("\n"));
@@ -275,17 +187,11 @@ impl PulseView {
             return;
         }
         let mut c = Capture {
-            dt, pre, fall_start, rise_raw: rise, fall_raw: fall, mean, plat, count, end, why: None, clipped, timeout, seq: self.seq + 1,
-            rise: Vec::new(), fall: Vec::new(), env, env_bucket: eb, base: 0.0, half: 0.0, r50: None, f50: None, shot: None,
+            dt, pre, fall_start, rise_raw: rise, fall_raw: fall, level, clipped, timeout, seq: self.seq + 1,
+            rise: Vec::new(), fall: Vec::new(), env, env_bucket: eb, t_rise: None, t_fall: None, shot: None,
         };
         c.analyze(self.filt);
-        if c.is_noise() {
-            // not a pulse: keep showing the last one and wait for the next
-            self.ignored += 1;
-            self.rearm = true;
-            return;
-        }
-        self.ignored = 0;
+        self.stale = false;
         if let Some(s) = &c.shot {
             self.seq = s.seq;
             if !s.timeout {
@@ -293,11 +199,6 @@ impl PulseView {
             }
         }
         self.last = Some(c);
-    }
-
-    /// true once after a noise trigger was ignored: arm again
-    pub fn take_rearm(&mut self) -> bool {
-        std::mem::take(&mut self.rearm)
     }
 
     /// Filter setting of the scope; a change re-measures the last pulse with it.
@@ -329,14 +230,10 @@ impl PulseView {
                         ui.label(RichText::new(v).monospace());
                         ui.end_row();
                     };
-                    row(ui, "Open (50%)", fmt_time(s.width));
+                    row(ui, "Open time", fmt_time(s.width));
                     row(ui, "Speed", speed_text(s.width));
                     row(ui, "Nominal", nominal_text(s.nominal));
                     row(ui, "Error", format!("{:+.1} %  {:+.2} EV", (s.width / s.nominal - 1.0) * 100.0, s.ev));
-                    row(ui, "Effective", fmt_time(s.teff));
-                    row(ui, "Rise 10-90", s.rise.map(fmt_time).unwrap_or("-".into()));
-                    row(ui, "Fall 90-10", s.fall.map(fmt_time).unwrap_or("-".into()));
-                    row(ui, "Peak", format!("{:.0} lx", s.peak_lx));
                 });
                 if s.clipped {
                     ui.label(RichText::new("Too bright: the sensor saturated").color(RED).strong());
@@ -346,7 +243,7 @@ impl PulseView {
                 }
             }
             None => {
-                ui.label(RichText::new(self.last.as_ref().and_then(|c| c.why).unwrap_or("no pulse yet")).weak());
+                ui.label(RichText::new(if self.last.is_some() { "The level crossings were not found" } else { "no pulse yet" }).weak());
             }
         }
         ui.separator();
@@ -407,12 +304,11 @@ impl PulseView {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
         let path = dir.join(format!("sutterspeed_pulses_{secs}.csv"));
-        let o = |v: Option<f64>| v.map(|v| format!("{v:.9}")).unwrap_or_default();
-        let mut s = String::from("seq,width_s,speed,nominal,ev,teff_s,rise_s,fall_s,peak_lx,clipped\n");
+        let mut s = String::from("seq,width_s,speed,nominal,ev,clipped\n");
         for x in &self.shots {
             s += &format!(
-                "{},{:.9},{},{},{:.3},{:.9},{},{},{:.1},{}\n",
-                x.seq, x.width, speed_text(x.width), nominal_text(x.nominal), x.ev, x.teff, o(x.rise), o(x.fall), x.peak_lx, x.clipped
+                "{},{:.9},{},{},{:.3},{}\n",
+                x.seq, x.width, speed_text(x.width), nominal_text(x.nominal), x.ev, x.clipped
             );
         }
         self.note = match std::fs::write(&path, s) {
@@ -424,14 +320,12 @@ impl PulseView {
     // ---------------------------------------------------------------- graph
 
     /// The whole pulse in one graph: the min/max envelope from start to end, the opening and closing at full
-    /// resolution on top, the 50 % crossings marked, and the open time written above.
-    pub fn plot(&self, ui: &mut egui::Ui, armed: bool, level: f64, (y0, y1, ydiv): (f64, f64, f64)) {
+    /// resolution on top, the trigger level and its rising / falling crossings marked, the open time written above.
+    pub fn plot(&self, ui: &mut egui::Ui, armed: bool, level: f64, filtered: bool, (y0, y1, ydiv): (f64, f64, f64)) {
         ui.horizontal(|ui| {
             if armed {
-                ui.label(RichText::new(format!("WAITING FOR A PULSE  (light above {level:.0} lx)")).color(ORANGE).strong());
-            }
-            if self.ignored > 0 {
-                ui.label(RichText::new(format!("{} noise triggers ignored: raise the level", self.ignored)).color(RED));
+                let how = if filtered { "filtered" } else { "40 us average" };
+                ui.label(RichText::new(format!("WAITING FOR A PULSE  (light above {level:.0} lx, {how})")).color(ORANGE).strong());
             }
             if let Some(s) = self.last.as_ref().and_then(|c| c.shot.as_ref()) {
                 ui.label(RichText::new(speed_text(s.width)).size(26.0).strong());
@@ -447,7 +341,7 @@ impl PulseView {
         };
         let mut end = (c.fall_start + c.fall.len() as f64) * c.dt;
         let mut start = -(c.pre as f64) * c.dt;
-        if let (Some(r), Some(f)) = (c.r50, c.f50) {
+        if let (Some(r), Some(f)) = (c.t_rise, c.t_fall) {
             let (a, b) = ((r - c.pre as f64) * c.dt, (c.fall_start + f) * c.dt);
             let m = 0.2 * (b - a);
             (start, end) = ((a - m).max(start), (b + m).min(end));
@@ -465,10 +359,11 @@ impl PulseView {
         let fall: Vec<[f64; 2]> = c.fall.iter().enumerate().map(|(i, &v)| [(c.fall_start + i as f64) * c.dt * unit, v]).collect();
         let rise_raw: Vec<[f64; 2]> = c.rise_raw.iter().enumerate().map(|(i, &v)| [(i as f64 - c.pre as f64) * c.dt * unit, v]).collect();
         let fall_raw: Vec<[f64; 2]> = c.fall_raw.iter().enumerate().map(|(i, &v)| [(c.fall_start + i as f64) * c.dt * unit, v]).collect();
-        let t_open = c.r50.map(|r| (r - c.pre as f64) * c.dt * unit);
-        let t_close = c.f50.map(|f| (c.fall_start + f) * c.dt * unit);
-        let top = c.env.iter().map(|e| e.1).chain(c.rise.iter().copied()).fold(c.half, f64::max);
+        let t_open = c.t_rise.map(|r| (r - c.pre as f64) * c.dt * unit);
+        let t_close = c.t_fall.map(|f| (c.fall_start + f) * c.dt * unit);
+        let top = c.env.iter().map(|e| e.1).chain(c.rise.iter().copied()).fold(c.level, f64::max);
         let (x0, x1) = (start * unit, end * unit);
+        let tr = if self.stale { TRACE.gamma_multiply(0.35) } else { TRACE };
         let ty = (y1 - 0.4 * ydiv).min(top + 0.4 * ydiv).max(y0 + 0.4 * ydiv);
         Plot::new("pulse_all")
             .height(ui.available_height())
@@ -482,20 +377,19 @@ impl PulseView {
             .y_axis_formatter(|m, _| format!("{} lx", (m.value * 1000.0).round() / 1000.0))
             .show(ui, |p| {
                 p.set_plot_bounds(egui_plot::PlotBounds::from_min_max([x0, y0], [x1, y1]));
-                p.line(Line::new("max", PlotPoints::from(hi)).color(TRACE.gamma_multiply(0.45)));
-                p.line(Line::new("min", PlotPoints::from(lo)).color(TRACE.gamma_multiply(0.45)));
+                p.line(Line::new("max", PlotPoints::from(hi)).color(tr.gamma_multiply(0.45)));
+                p.line(Line::new("min", PlotPoints::from(lo)).color(tr.gamma_multiply(0.45)));
                 if self.filt.0 != 0 {
                     for (nm, raw) in [("opening raw", rise_raw), ("closing raw", fall_raw)] {
-                        p.line(Line::new(nm, PlotPoints::from(raw)).color(TRACE.gamma_multiply(0.25)).width(1.0));
+                        p.line(Line::new(nm, PlotPoints::from(raw)).color(tr.gamma_multiply(0.25)).width(1.0));
                     }
                 }
-                p.line(Line::new("opening", PlotPoints::from(rise)).color(TRACE).width(1.5));
-                p.line(Line::new("closing", PlotPoints::from(fall)).color(TRACE).width(1.5));
-                p.hline(HLine::new("50 %", c.half).color(BLUE).style(LineStyle::dashed_dense()));
-                p.hline(HLine::new("dark", c.base).color(Color32::GRAY).style(LineStyle::dashed_loose()));
+                p.line(Line::new("opening", PlotPoints::from(rise)).color(tr).width(1.5));
+                p.line(Line::new("closing", PlotPoints::from(fall)).color(tr).width(1.5));
+                p.hline(HLine::new("trigger level", c.level).color(ORANGE).style(LineStyle::dashed_dense()));
                 if let (Some(a), Some(b)) = (t_open, t_close) {
-                    p.vline(VLine::new("open", a).color(BLUE).width(1.5));
-                    p.vline(VLine::new("close", b).color(BLUE).width(1.5));
+                    p.vline(VLine::new("rising", a).color(BLUE).width(1.5));
+                    p.vline(VLine::new("falling", b).color(BLUE).width(1.5));
                     let w = (b - a) / unit;
                     p.text(
                         egui_plot::Text::new("w", egui_plot::PlotPoint::new((a + b) / 2.0, ty), RichText::new(format!("<- {} ->", fmt_time(w))).color(BLUE).size(15.0).strong()),
@@ -509,55 +403,61 @@ impl PulseView {
 mod tests {
     use super::*;
 
-    /// a noisy flat pulse in the two windows the board sends; returns the measured width
-    fn measure(width_n: usize, base: f64, top: f64, amp: f64) -> Capture {
+    /// a flat pulse of `width_n` samples with uniform noise +-amp and a 44.7 kHz flicker +-flick, in the two
+    /// windows the board sends
+    fn measure_fl(width_n: usize, base: f64, top: f64, amp: f64, flick: f64, level: f64, f: Filt) -> Capture {
         let (pre, win) = (436usize, 1744usize);
         let mut seed = 12345u32;
         let mut noise = || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
             ((seed >> 8) as f64 / (1u32 << 24) as f64 - 0.5) * 2.0 * amp
         };
-        let lvl = |rel: i64| if rel >= 0 && (rel as usize) < width_n { top } else { base };
+        let lvl = |rel: i64| {
+            let fl = flick * (2.0 * std::f64::consts::PI * 44.7e3 * rel as f64 * 2.5e-6).sin();
+            fl + if rel >= 0 && (rel as usize) < width_n { top } else { base }
+        };
         let rise: Vec<f64> = (0..win).map(|i| lvl(i as i64 - pre as i64) + noise()).collect();
         let fcount = (width_n + 40 + 436).max(1307);
         let fall_n = fcount.min(win);
         let fs = (fcount - fall_n) as f64;
         let fall: Vec<f64> = (0..fall_n).map(|i| lvl(fs as i64 + i as i64) + noise()).collect();
         let mut c = Capture {
-            dt: 2.5e-6, pre, fall_start: fs, rise_raw: rise, fall_raw: fall, mean: top, plat: top + amp, count: width_n as f64,
-            end: width_n as f64, why: None, clipped: false, timeout: false, seq: 1, rise: vec![], fall: vec![], env: vec![],
-            env_bucket: 16.0, base: 0.0, half: 0.0, r50: None, f50: None, shot: None,
+            dt: 2.5e-6, pre, fall_start: fs, rise_raw: rise, fall_raw: fall, level, clipped: false,
+            timeout: false, seq: 1, rise: vec![], fall: vec![], env: vec![], env_bucket: 16.0, t_rise: None, t_fall: None,
+            shot: None,
         };
-        c.analyze((0, 1.0, 1e3));
+        c.analyze(f);
         c
     }
 
+    fn measure(width_n: usize, base: f64, top: f64, amp: f64, level: f64, f: Filt) -> Capture {
+        measure_fl(width_n, base, top, amp, 0.0, level, f)
+    }
+
     #[test]
-    fn noisy_pulses() {
-        // room light 120 lx +-30 (the 2.5 us samples are noisy), pulse to 400 lx
-        for n in [50usize, 400, 1600, 4000, 40000] {
-            let c = measure(n, 120.0, 400.0, 30.0);
-            let w = c.shot.as_ref().expect("measured").width;
+    fn flicker_crossing_the_level() {
+        // room light 23 lx flickering +-80 lx (crosses the 85 lx level every 22 us), pulse to 1000 lx
+        for n in [50usize, 400, 1600, 40000] {
+            let w = measure_fl(n, 23.0, 1000.0, 5.0, 80.0, 85.0, (0, 1.0, 1e3)).shot.expect("measured").width;
             let want = n as f64 * 2.5e-6;
-            assert!((w / want - 1.0).abs() < 0.02 + 2.5e-6 / want, "n {n}: {w} vs {want}");
+            assert!((w - want).abs() <= 2.5e-6, "n {n}: {w} vs {want}");
         }
     }
 
     #[test]
-    fn noise_is_not_a_pulse() {
-        // a 2-sample spike over the level
-        let c = measure(2, 120.0, 260.0, 30.0);
-        assert!(c.is_noise(), "{:?}", c.why);
-        // a pulse buried in the noise
-        let c = measure(800, 120.0, 126.0, 30.0);
-        assert!(c.is_noise(), "{:?}", c.why);
+    fn rising_to_falling() {
+        // room light 120 lx +-30, pulse to 1000 lx, level 400 lx: the noise never reaches the level
+        for n in [50usize, 400, 1600, 4000, 40000] {
+            let w = measure(n, 120.0, 1000.0, 30.0, 400.0, (0, 1.0, 1e3)).shot.expect("measured").width;
+            let want = n as f64 * 2.5e-6;
+            assert!((w - want).abs() <= 2.5e-6, "n {n}: {w} vs {want}");
+        }
     }
 
     #[test]
-    fn faint_long_pulse() {
-        // 30 lx above the room light, under the 2.5 us noise (17 lx rms) but clear over 2 ms
-        let c = measure(800, 120.0, 150.0, 30.0);
-        let w = c.shot.as_ref().map(|s| s.width).unwrap_or(0.0);
-        assert!((w / 2e-3 - 1.0).abs() < 0.05, "{w} {:?}", c.why);
+    fn filter_for_a_noisy_level() {
+        // noise +-150 lx around a level 100 lx above the room light: the 9-point average makes the crossings clean
+        let w = measure(1600, 120.0, 1000.0, 150.0, 220.0, (1, 9.0, 1e3)).shot.expect("measured").width;
+        assert!((w / 4e-3 - 1.0).abs() < 0.005, "{w}");
     }
 }

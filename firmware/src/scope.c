@@ -5,7 +5,7 @@
    - roll: the decimated samples go through a small queue.
    - pulse: full rate. A rising-edge window around the trigger, a falling-edge window around the end of the
      pulse and a min/max envelope of the whole pulse (buckets double when full), so any length is captured
-     with 2.5 us edges. Start and end are decided on a lightly smoothed value (the 2.5 us samples are noisy);
+     with 2.5 us edges. Start and end are decided on an average: two stages of y += (x - y) / 2^tfk (0 = raw);
      the pulse ends once PULSE_END_N more samples were below the level than (weighted) above it, so noise around
      the level cannot hold it open. The windows keep the raw samples. */
 #include "scope.h"
@@ -16,7 +16,8 @@
 #define FALL  (PULSE_WIN)          /* falling window = samples [PULSE_WIN, 2*PULSE_WIN) of mem */
 #define ENV0  (2 * PULSE_WIN)      /* envelope pairs follow */
 
-enum { S_STOP, S_FILL, S_ARMED, S_POST, S_DONE, S_HIGH, S_TAIL, S_SEND };
+enum { S_STOP, S_FILL, S_ARMED, S_POST, S_DONE, S_HIGH, S_TAIL, S_SEND, S_QUAL };
+/* S_QUAL: past the level, waiting `minw` samples to see it stays there (the record keeps counting `post`) */
 /* S_SEND: a frame is being sent. New samples already refill the history, but only over samples that are out. */
 
 static int16_t mem[SCOPE_NMAX];   /* frame ring / pulse windows / roll queue */
@@ -32,6 +33,7 @@ static bool tf_ok;
 static volatile uint32_t send_sent;
 static uint32_t dec_recip = 1u << 24;
 static volatile bool force;
+static uint32_t q_n, trig_extra;  /* S_QUAL: samples beyond the level so far; samples recorded beyond `post` */
 static bool forced;
 static uint32_t armed_ms;
 #define rollq mem
@@ -46,7 +48,7 @@ static uint32_t e_n, e_bucket, e_cnt;
 static int32_t e_min, e_max;
 static bool p_clip, p_timeout, p_rdone;
 static uint32_t p_w0;           /* rising-window write position right after the trigger sample */
-static int32_t p_y;             /* smoothed value for the start / end decisions */
+static int32_t p_y, p_y1;       /* averaged value for the start / end decisions, and its first stage */
 static bool p_yok;
 
 static void rearm(void) {          /* call with the DMA interrupt masked or from it */
@@ -152,10 +154,19 @@ RAMFUNC static void feed(const int32_t *v, uint32_t m) {
         forced = !hit;
         force = false;
         pl = post;
-        state = pl ? S_POST : S_DONE;
+        trig_extra = 0;
+        if (hit && cfg.mode != SCOPE_FREE && cfg.minw > 1) { q_n = 1; state = S_QUAL; }
+        else state = pl ? S_POST : S_DONE;
       }
     } else if (state == S_FILL) {
       if (++f >= pre) state = S_ARMED;
+    } else if (state == S_QUAL) {
+      if (fall ? x >= lv : x < lv) {
+        state = S_ARMED;                          /* back across the level too soon: no trigger */
+      } else {
+        if (pl) pl--; else trig_extra++;
+        if (++q_n >= cfg.minw) state = pl ? S_POST : S_DONE;
+      }
     } else if (--pl == 0) {                       /* S_POST */
       state = S_DONE;
     }
@@ -192,14 +203,16 @@ RAMFUNC static uint32_t pulse_wait(const int32_t *v, uint32_t m) {
   int32_t pv = prev;
   const int32_t lv = cfg.falling ? -cfg.level : cfg.level;
   const int32_t sg = cfg.falling ? -1 : 0;        /* (x ^ sg) - sg = -x for a falling edge, without a multiply */
-  int32_t y = p_y;
-  if (!p_yok && m) { y = v[0]; p_yok = true; }
+  const uint32_t tk = cfg.tfk;
+  int32_t y = p_y, y1 = p_y1;
+  if (!p_yok && m) { y = y1 = v[0]; p_yok = true; }
   uint32_t j = 0;
   for (; j < m; j++) {
     const int32_t x = v[j];
     mem[w] = scope_enc(x);
     if (++w == PULSE_WIN) w = 0;
-    y += (x - y) >> PULSE_SMOOTH;
+    y1 += (x - y1) >> tk;
+    y += (y1 - y) >> tk;
     const int32_t xs = (y ^ sg) - sg;
     if (state == S_ARMED) {
       if (pv < lv && xs >= lv) break;
@@ -208,7 +221,7 @@ RAMFUNC static uint32_t pulse_wait(const int32_t *v, uint32_t m) {
     }
     pv = xs;
   }
-  wi = w; filled = f; prev = pv; st = (uint8_t)state; p_y = y;
+  wi = w; filled = f; prev = pv; st = (uint8_t)state; p_y = y; p_y1 = y1;
   return j;
 }
 
@@ -236,6 +249,22 @@ RAMFUNC static void rise_copy(void) {
   }
   wi = w;
   p_rdone = true;
+}
+
+/* A pulse shorter than minw: not one. Its samples (in the falling ring) go back into the rising-window ring, so
+   the history stays continuous, and the trigger waits again. */
+RAMFUNC static void pulse_drop(void) {
+  if (p_rdone || p_fcount > PULSE_WIN) { wi = 0; filled = 0; st = S_FILL; return; }   /* too long to put back */
+  const int16_t *const fb = &mem[FALL + 1];
+  uint32_t w = p_w0;
+  for (uint32_t k = 0; k + 1 < p_fcount; k++) {
+    mem[w] = fb[k];
+    if (++w == PULSE_WIN) w = 0;
+  }
+  wi = w;
+  filled = PULSE_PRE;
+  prev = cfg.falling ? -p_y : p_y;
+  st = S_ARMED;
 }
 
 /* append samples to the falling-window ring */
@@ -267,24 +296,33 @@ RAMFUNC static void body_blocks(const int32_t *v, uint32_t m) {
 }
 
 /* samples after the trigger; short passes, each with few live values */
-RAMFUNC static void pulse_run(const int32_t *v, uint32_t m) {
+RAMFUNC static uint32_t pulse_run(const int32_t *v, uint32_t m) {   /* returns the samples used */
   if (st == S_HIGH) {
     /* pass 1: sum and end detection (stops at the end) */
     const int32_t lv = cfg.falling ? -cfg.level : cfg.level;
     const int32_t sg = cfg.falling ? -1 : 0;     /* (x ^ sg) - sg = -x for a dark pulse, no multiply */
     const uint32_t maxp = p_maxp;
-    int32_t sum = 0, y = p_y;
+    const uint32_t tk = cfg.tfk;
+    int32_t sum = 0, y = p_y, y1 = p_y1;
     uint32_t low = p_low, cnt = p_cnt, je = m;
+    const uint32_t qual = cfg.minw;               /* the first `minw` samples must all stay past the level */
     for (uint32_t j = 0; j < m; j++) {
       const int32_t x = v[j];
       sum += x;
       cnt++;
-      y += (x - y) >> PULSE_SMOOTH;
+      y1 += (x - y1) >> tk;
+      y += (y1 - y) >> tk;
+      if (cnt <= qual && ((y ^ sg) - sg) < lv) {  /* back across too soon: not a pulse, wait for the next */
+        p_y = y; p_y1 = y1;
+        fall_write(v, j + 1);
+        pulse_drop();
+        return j + 1;
+      }
       /* below: one step towards the end; above: eight back (noise must be mostly below to end it) */
       low = ((y ^ sg) - sg) < lv ? low + 1 : low > 8 ? low - 8 : 0;
       if (low >= PULSE_END_N || cnt > maxp) { je = j + 1; break; }
     }
-    p_sum += sum; p_low = low; p_cnt = cnt; p_y = y;
+    p_sum += sum; p_low = low; p_cnt = cnt; p_y = y; p_y1 = y1;
     body_blocks(v, je);                           /* pass 2 */
     if (je < m || low >= PULSE_END_N || cnt > maxp) {
       p_timeout = low < PULSE_END_N;
@@ -306,6 +344,7 @@ RAMFUNC static void pulse_run(const int32_t *v, uint32_t m) {
     p_tail = p_tail > t ? p_tail - t : 0;
   }
   if (st == S_TAIL && p_tail == 0 && p_fcount >= RISE_POST + 1) st = S_DONE;
+  return m;
 }
 
 RAMFUNC static void pulse_feed(const int32_t *v, uint32_t m) {
@@ -316,8 +355,9 @@ RAMFUNC static void pulse_feed(const int32_t *v, uint32_t m) {
       pulse_start(v[j]);
       v += j + 1; m -= j + 1;
     } else if (st == S_HIGH || st == S_TAIL) {
-      pulse_run(v, m);
-      return;
+      const uint32_t used = pulse_run(v, m);
+      if (used >= m) return;
+      v += used; m -= used;                       /* a pulse was dropped: the rest waits for the next */
     } else {
       return;
     }
@@ -423,6 +463,8 @@ bool scope_pulse(scope_pulse_t *p) {
 }
 
 void scope_frame_sent(uint32_t count) { send_sent = count; }
+
+uint32_t scope_trig_extra(void) { return trig_extra; }
 
 void scope_frame_done(uint32_t now_ms) {
   __disable_irq();
