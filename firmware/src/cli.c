@@ -10,7 +10,7 @@
 #include "scope.h"
 #include "tusb.h"
 
-#define FW_VERSION "0.3.7"
+#define FW_VERSION "0.3.8"
 #include <math.h>
 
 extern volatile uint32_t acq_overruns, acq_isr_us_max, acq_isr_us_last, acq_isr_calls;

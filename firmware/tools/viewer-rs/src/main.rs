@@ -9,6 +9,7 @@
 #![windows_subsystem = "windows"]
 
 mod dfu;
+mod github;
 mod icons;
 mod knob;
 mod pulse;
@@ -170,6 +171,7 @@ struct App {
     input: String,
     scope: scope::ScopeView,
     upd: Update,
+    fw_ver: Option<String>, // firmware version the board reported
     dbg_frames: u32, // SSV_FPS=1: frames per second in the window title
     dbg_at: Instant,
     dbg_ui: f64, // time spent in ui() this second, ms
@@ -185,6 +187,14 @@ struct Update {
     progress: f32,
     msg: String,
     result: Option<Result<String, String>>,
+    gh: Option<Receiver<GhEv>>, // update from GitHub in progress
+    gh_log: Vec<(bool, String)>, // (error, text)
+    restart: bool,              // a new viewer is in place: restart to use it
+}
+
+enum GhEv {
+    Status(String),
+    Done(Result<(String, Vec<u8>, Option<Vec<u8>>), String>), // tag, firmware .hex, newer viewer
 }
 
 /// firmware next to the viewer (tools/ -> ../build/sutterspeed.hex) or in the same folder
@@ -209,6 +219,7 @@ impl App {
             input: String::new(),
             scope: scope::ScopeView::new(),
             upd: Update::default(),
+            fw_ver: None,
             dbg_frames: 0,
             dbg_at: Instant::now(),
             dbg_ui: 0.0,
@@ -257,6 +268,8 @@ impl App {
                 Ev::Connected(n) => {
                     self.status = format!("{n} connected");
                     self.connected = Some(n);
+                    self.fw_ver = None;
+                    self.send("ver");
                     for c in self.scope.start_cmds() {
                         self.send(&c);
                     }
@@ -270,6 +283,13 @@ impl App {
                     self.status = "Not connected".into();
                 }
                 Ev::Line(ln) => {
+                    // "sutterspeed fw 0.3.8  scan ..." (ver) or "sutterspeed 0.3.8 light scope ready"
+                    if let Some(r) = ln.strip_prefix("sutterspeed ") {
+                        let v = r.trim_start_matches("fw ").split_whitespace().next().unwrap_or("");
+                        if github::version(v).is_some() {
+                            self.fw_ver = Some(v.to_string());
+                        }
+                    }
                     let echo = ln.starts_with("scope ");
                     if !self.scope.on_line(&ln) || echo {
                         // shot lines of the (paused) shutter measurement are not used here
@@ -345,7 +365,7 @@ impl App {
             let col = if self.connected.is_some() { GREEN } else if self.want_conn { ORANGE } else { Color32::GRAY };
             ui.label(RichText::new(&self.status).color(col).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, Icon::Firmware, "Firmware update (USB)\nwrite a .hex / .bin file to the board", true, GREEN).clicked() {
+                if icon_button(ui, Icon::Firmware, "Update\nfirmware and viewer from GitHub, or a .hex / .bin file", true, GREEN).clicked() {
                     self.upd.open = true;
                     if self.upd.path.is_none() {
                         if let Some(p) = default_firmware() {
@@ -428,7 +448,79 @@ impl App {
         self.upd.result = None;
     }
 
+    fn start_github(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let wake = ctx.clone();
+        thread::spawn(move || {
+            let send = |e: GhEv| {
+                let _ = tx.send(e);
+                wake.request_repaint();
+            };
+            let r = (|| {
+                send(GhEv::Status("Looking for the newest release...".into()));
+                let tag = github::latest_tag()?;
+                send(GhEv::Status(format!("Newest release {tag}: downloading...")));
+                let hex = github::download("sutterspeed.hex")?;
+                let exe = if github::version(&tag) > github::version(env!("CARGO_PKG_VERSION")) {
+                    Some(github::download("sutterspeed-viewer.exe")?)
+                } else {
+                    None
+                };
+                Ok((tag, hex, exe))
+            })();
+            send(GhEv::Done(r));
+        });
+        self.upd.gh = Some(rx);
+        self.upd.gh_log.clear();
+        self.upd.result = None;
+    }
+
+    fn github_events(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.upd.gh else { return };
+        let evs: Vec<GhEv> = rx.try_iter().collect();
+        for e in evs {
+            match e {
+                GhEv::Status(s) => self.upd.gh_log.push((false, s)),
+                GhEv::Done(Err(e)) => {
+                    self.upd.gh = None;
+                    self.upd.gh_log.push((true, e));
+                }
+                GhEv::Done(Ok((tag, hex, exe))) => {
+                    self.upd.gh = None;
+                    let newest = github::version(&tag);
+                    // viewer
+                    match exe {
+                        Some(b) => match github::replace_viewer(&b) {
+                            Ok(()) => {
+                                self.upd.gh_log.push((false, format!("Viewer {tag} downloaded: restart to use it")));
+                                self.upd.restart = true;
+                            }
+                            Err(e) => self.upd.gh_log.push((true, e)),
+                        },
+                        None => self.upd.gh_log.push((false, format!("Viewer {} is up to date", env!("CARGO_PKG_VERSION")))),
+                    }
+                    // firmware: written when the board has an older one (or did not say which)
+                    let board = self.fw_ver.as_deref().and_then(github::version);
+                    if board.is_some() && board >= newest {
+                        self.upd.gh_log.push((false, format!("Board firmware {} is up to date", self.fw_ver.clone().unwrap_or_default())));
+                    } else {
+                        match dfu::load_bytes(hex, true) {
+                            Ok(img) => {
+                                self.upd.gh_log.push((false, format!("Writing firmware {tag} to the board...")));
+                                self.upd.image = Some(Ok(img));
+                                self.upd.path = Some(std::path::PathBuf::from(format!("GitHub {tag}: sutterspeed.hex")));
+                                self.start_update(ctx);
+                            }
+                            Err(e) => self.upd.gh_log.push((true, format!("firmware {tag}: {e}"))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn update_window(&mut self, ctx: &egui::Context) {
+        self.github_events(ctx);
         if let Some(rx) = &self.upd.rx {
             let evs: Vec<dfu::Progress> = rx.try_iter().collect();
             for e in evs {
@@ -449,7 +541,7 @@ impl App {
                 }
             }
         }
-        let busy = self.upd.rx.is_some();
+        let busy = self.upd.rx.is_some() || self.upd.gh.is_some();
         if !self.upd.open {
             return;
         }
@@ -462,13 +554,34 @@ impl App {
         let mut open = self.upd.open;
         let mut start = false;
         let mut pick = false;
-        egui::Window::new("Firmware update (USB)")
+        let mut github = false;
+        let mut restart = false;
+        egui::Window::new("Update")
             .collapsible(false)
             .resizable(false)
             .default_width(460.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("Writes new firmware (.hex / .bin) over USB. No ST-LINK needed.");
+                // ---- from GitHub: the newest release, firmware and viewer
+                let board = self.fw_ver.clone().unwrap_or_else(|| "?".into());
+                ui.label(format!("Viewer {}   Board firmware {board}", env!("CARGO_PKG_VERSION")));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Update from GitHub").strong()).min_size(egui::vec2(160.0, 28.0)))
+                        .on_hover_text("Downloads the newest release: writes its firmware to the board when it is newer, replaces this viewer when it is newer")
+                        .clicked()
+                    {
+                        github = true;
+                    }
+                    if self.upd.restart && ui.add_enabled(!busy, egui::Button::new(RichText::new("Restart viewer").strong().color(GREEN))).clicked() {
+                        restart = true;
+                    }
+                });
+                for (err, t) in &self.upd.gh_log {
+                    ui.label(if *err { RichText::new(t).color(Color32::from_rgb(220, 70, 60)) } else { RichText::new(t) });
+                }
+                ui.separator();
+                // ---- from a file
+                ui.label("Or write a firmware file (.hex / .bin) over USB. No ST-LINK needed.");
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!busy, |ui| {
@@ -520,6 +633,16 @@ impl App {
         }
         if start {
             self.start_update(ctx);
+        }
+        if github {
+            self.start_github(ctx);
+        }
+        if restart {
+            if let Ok(exe) = std::env::current_exe() {
+                if std::process::Command::new(exe).spawn().is_ok() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
         self.upd.open = open || busy; // stay open while flashing
     }
@@ -625,7 +748,30 @@ fn flash_cli(path: Option<&String>) -> i32 {
     if ok.get() { 0 } else { 1 }
 }
 
+/// `sutterspeed-viewer --update`: replace this viewer with the newest release when that one is newer (no window)
+fn update_cli() -> i32 {
+    let r = github::latest_tag().and_then(|tag| {
+        if github::version(&tag) <= github::version(env!("CARGO_PKG_VERSION")) {
+            return Ok(format!("viewer {} is up to date (newest release {tag})", env!("CARGO_PKG_VERSION")));
+        }
+        println!("downloading viewer {tag}...");
+        github::replace_viewer(&github::download("sutterspeed-viewer.exe")?)?;
+        Ok(format!("viewer {} -> {tag}", env!("CARGO_PKG_VERSION")))
+    });
+    match r {
+        Ok(m) => {
+            println!("{m}");
+            0
+        }
+        Err(e) => {
+            println!("error: {e}");
+            1
+        }
+    }
+}
+
 fn main() -> eframe::Result {
+    github::remove_old(); // the viewer the last update replaced
     // DirectX 12 presents through the desktop compositor like any Windows app (Vulkan / OpenGL windows can make
     // a multi-monitor, high-refresh desktop stutter)
     if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -634,6 +780,9 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--flash") {
         std::process::exit(flash_cli(args.get(i + 1)));
+    }
+    if args.iter().any(|a| a == "--update") {
+        std::process::exit(update_cli());
     }
     let sim = args.iter().any(|a| a == "--sim");
     let port = args.into_iter().find(|a| !a.starts_with("--"));

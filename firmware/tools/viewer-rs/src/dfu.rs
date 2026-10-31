@@ -39,6 +39,11 @@ pub struct Image {
 pub fn load(path: &std::path::Path) -> Result<Image, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read the file: {e}"))?;
     let is_hex = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hex"));
+    load_bytes(bytes, is_hex)
+}
+
+/// firmware from memory (.hex text or a raw .bin)
+pub fn load_bytes(bytes: Vec<u8>, is_hex: bool) -> Result<Image, String> {
     let img = if is_hex { parse_hex(&String::from_utf8_lossy(&bytes))? } else { Image { addr: FLASH_BASE, data: bytes } };
     if img.data.is_empty() {
         return Err("empty file".into());

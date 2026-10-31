@@ -51,8 +51,10 @@ board and pick its COM port.
   (on the filtered trace when a filter is set), with the nearest nominal speed and the error in EV. The trigger looks
   at a 40 µs average (or the filter), the timing at the 2.5 µs samples. Pulses from about 100 µs to tens of seconds.
   ▶ goes back to the running scope.
-- **Firmware update**: the chip icon flashes a `.hex`/`.bin` over USB (ST system bootloader, DfuSe),
-  or from a script: `sutterspeed-viewer --flash sutterspeed.hex`.
+- **Update** (chip icon): *Update from GitHub* downloads the newest release, writes its firmware to the board when it
+  is newer (USB, ST system bootloader / DfuSe) and replaces the viewer when it is newer (restart to use it).
+  A `.hex`/`.bin` file can be written too. From a script: `sutterspeed-viewer --flash sutterspeed.hex`,
+  `sutterspeed-viewer --update` (viewer only).
 
 Build: `cd firmware/tools/viewer-rs && cargo build --release`.
 
