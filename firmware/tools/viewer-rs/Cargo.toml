@@ -1,6 +1,6 @@
 [package]
 name = "sutterspeed-viewer"
-version = "0.3.8"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ nusb = "0.1"
 rfd = "0.17.2"
 serialport = "4.10"
 ureq = "2.12"
+windows-sys = { version = "0.59", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = 3

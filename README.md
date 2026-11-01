@@ -21,7 +21,7 @@ KiCad 10 project in [`kicad/`](kicad), fabrication files (BOM, positions, Gerber
 | path | contents |
 | --- | --- |
 | [`firmware/src`](firmware/src) | firmware: ADC/DMA acquisition, scope engine (trigger, decimation, roll, pulse capture), USB CDC command line |
-| [`firmware/tools/viewer-rs`](firmware/tools/viewer-rs) | Windows viewer (Rust, egui), also flashes firmware over USB DFU |
+| [`firmware/tools/viewer-rs`](firmware/tools/viewer-rs) | Windows viewer (Rust, egui), also updates the firmware over USB |
 | [`firmware/test`](firmware/test) | host test of the scope engine with synthetic light pulses |
 | [`firmware/lib`](firmware/lib) | CMSIS, STM32C0 HAL, TinyUSB (git submodules) |
 | [`code/`](code) | STM32CubeMX pin configuration |
@@ -52,9 +52,11 @@ board and pick its COM port.
   at a 40 µs average (or the filter), the timing at the 2.5 µs samples. Pulses from about 100 µs to tens of seconds.
   ▶ goes back to the running scope.
 - **Update** (chip icon): *Update from GitHub* downloads the newest release, writes its firmware to the board when it
-  is newer (USB, ST system bootloader / DfuSe) and replaces the viewer when it is newer (restart to use it).
-  A `.hex`/`.bin` file can be written too. From a script: `sutterspeed-viewer --flash sutterspeed.hex`,
-  `sutterspeed-viewer --update` (viewer only).
+  is newer and replaces the viewer when it is newer (restart to use it). Firmware goes over USB through the board's
+  own bootloader, which needs no driver; no STM32CubeProgrammer needed. Older boards (before 0.4.0) and blank chips
+  are written through the ST bootloader; if the PC has no driver for it, the viewer installs Windows' own WinUSB
+  (one Windows permission prompt). A `.hex`/`.bin` file can be written too. From a script:
+  `sutterspeed-viewer --flash sutterspeed.hex`, `sutterspeed-viewer --update` (viewer only).
 
 Build: `cd firmware/tools/viewer-rs && cargo build --release`.
 

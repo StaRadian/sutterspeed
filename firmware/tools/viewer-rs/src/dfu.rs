@@ -1,19 +1,29 @@
-//! Firmware update over USB: the board's `dfu` command restarts it into the STM32 system bootloader
-//! (USB 0483:DF11, WinUSB driver), which is then programmed with the DfuSe protocol (ST extensions of DFU 1.1):
-//! erase the pages, write 1 KB blocks, read them back, start the new firmware.
+//! Firmware update over USB. The board's `dfu` command restarts it into a USB bootloader:
+//! - ours (boot/boot.c, USB 1209:0002, the first 12 KB of the flash): plain DFU 1.1, 2 KB blocks of the firmware
+//!   from APP_BASE on; it erases, writes and reads back itself. Windows binds WinUSB from its descriptors.
+//! - on boards without it (firmware before 0.4.0, or a blank chip) the STM32 system bootloader (USB 0483:DF11),
+//!   programmed with the DfuSe protocol (ST extensions of DFU 1.1): erase, write 1 KB blocks, read back, start.
+//!   It gets the whole flash image, our bootloader included. Its WinUSB driver comes from driver.rs if missing.
+//! sutterspeed.hex holds the whole image (bootloader + firmware).
 
+use crate::driver;
 use nusb::transfer::{Control, ControlType, Recipient};
 use std::time::{Duration, Instant};
 
 const DFU_VID: u16 = 0x0483;
 const DFU_PID: u16 = 0xDF11;
+const BOOT_VID: u16 = 0x1209;
+const BOOT_PID: u16 = 0x0002;
 const FLASH_BASE: u32 = 0x0800_0000;
 const FLASH_SIZE: u32 = 64 * 1024; // STM32C071G8
+const APP_OFFSET: u32 = 0x3000; // firmware behind the bootloader (src/layout.h)
 const PAGE: u32 = 2048;
 const CHUNK: usize = 1024;
+const BOOT_BLOCK: usize = 2048; // wTransferSize of our bootloader
 const TO: Duration = Duration::from_secs(5);
 
 // DFU requests and states
+const DETACH: u8 = 0;
 const DNLOAD: u8 = 1;
 const UPLOAD: u8 = 2;
 const GETSTATUS: u8 = 3;
@@ -22,6 +32,7 @@ const ABORT: u8 = 6;
 const ST_IDLE: u8 = 2;
 const ST_DNBUSY: u8 = 4;
 const ST_DNIDLE: u8 = 5;
+const ST_MANIFEST: u8 = 7;
 const ST_UPIDLE: u8 = 9;
 const ST_ERROR: u8 = 10;
 
@@ -95,6 +106,26 @@ fn parse_hex(text: &str) -> Result<Image, String> {
         data[o..o + d.len()].copy_from_slice(&d);
     }
     Ok(Image { addr: lo, data })
+}
+
+fn vector_ok(v: &[u8], base: u32) -> bool {
+    v.len() >= 8 && {
+        let sp = u32::from_le_bytes(v[0..4].try_into().unwrap());
+        let pc = u32::from_le_bytes(v[4..8].try_into().unwrap());
+        sp & 0xFFF0_0000 == 0x2000_0000 && pc & 1 == 1 && pc > base && pc < FLASH_BASE + FLASH_SIZE
+    }
+}
+
+impl Image {
+    /// the firmware behind the bootloader: what our bootloader writes
+    fn app(&self) -> Option<&[u8]> {
+        let app = match self.addr {
+            FLASH_BASE if self.data.len() > APP_OFFSET as usize => &self.data[APP_OFFSET as usize..],
+            a if a == FLASH_BASE + APP_OFFSET => &self.data[..],
+            _ => return None,
+        };
+        vector_ok(app, FLASH_BASE + APP_OFFSET).then_some(app)
+    }
 }
 
 struct Dfu {
@@ -181,25 +212,68 @@ impl Dfu {
         let _ = self.out(DNLOAD, 0, &[]);
         let _ = self.status(); // the device usually disappears here
     }
-}
 
-pub fn dfu_present() -> bool {
-    nusb::list_devices().map(|mut it| it.any(|d| d.vendor_id() == DFU_VID && d.product_id() == DFU_PID)).unwrap_or(false)
-}
-
-fn open(wait: Duration) -> Result<Dfu, String> {
-    let t0 = Instant::now();
-    loop {
-        if let Ok(mut it) = nusb::list_devices() {
-            if let Some(di) = it.find(|d| d.vendor_id() == DFU_VID && d.product_id() == DFU_PID) {
-                let dev = di.open().map_err(|e| format!("cannot open the bootloader: {e} (check the STM32 Bootloader driver)"))?;
-                let intf = dev.claim_interface(0).map_err(|e| format!("cannot claim the interface: {e}"))?;
-                let _ = intf.set_alt_setting(0); // alt 0 = internal flash
-                return Ok(Dfu { intf });
+    // our bootloader: plain DFU 1.1
+    fn wait_manifest(&self) -> Result<(), String> {
+        let t0 = Instant::now();
+        loop {
+            let (status, state, poll) = self.status()?;
+            if state == ST_ERROR || status != 0 {
+                return Err(format!("the bootloader refused the firmware (status {status})"));
             }
+            if state != ST_MANIFEST {
+                return Ok(());
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                return Err("the bootloader does not answer".into());
+            }
+            std::thread::sleep(Duration::from_millis(poll.clamp(1, 200) as u64));
+        }
+    }
+}
+
+fn is_rom(d: &nusb::DeviceInfo) -> bool {
+    d.vendor_id() == DFU_VID && d.product_id() == DFU_PID
+}
+
+fn is_boot(d: &nusb::DeviceInfo) -> bool {
+    d.vendor_id() == BOOT_VID && d.product_id() == BOOT_PID
+}
+
+/// a bootloader (ours or ST's) is plugged in
+pub fn dfu_present() -> bool {
+    nusb::list_devices().map(|mut it| it.any(|d| is_rom(&d) || is_boot(&d))).unwrap_or(false) || driver::rom_needs_driver()
+}
+
+fn claim(di: nusb::DeviceInfo) -> Result<Dfu, String> {
+    let dev = di.open().map_err(|e| format!("cannot open the bootloader: {e}"))?;
+    let intf = dev.claim_interface(0).map_err(|e| format!("cannot claim the interface: {e}"))?;
+    let _ = intf.set_alt_setting(0); // alt 0 = internal flash
+    Ok(Dfu { intf })
+}
+
+/// wait for a bootloader; true = ours, false = ST's (whose WinUSB driver is installed here when it has none)
+fn open(wait: Duration, step: &dyn Fn(&str)) -> Result<(Dfu, bool), String> {
+    let t0 = Instant::now();
+    let mut installed = false;
+    loop {
+        let devs: Vec<nusb::DeviceInfo> = nusb::list_devices().map(|it| it.collect()).unwrap_or_default();
+        if let Some(di) = devs.iter().find(|d| is_boot(d)) {
+            // Windows may still be binding WinUSB right after the first plug-in
+            match claim(di.clone()) {
+                Ok(d) => return Ok((d, true)),
+                Err(e) if t0.elapsed() > wait => return Err(e),
+                Err(_) => {}
+            }
+        } else if let Some(di) = devs.iter().find(|d| is_rom(d) && d.driver().is_some_and(|s| s.eq_ignore_ascii_case("winusb"))) {
+            return claim(di.clone()).map(|d| (d, false));
+        } else if !installed && driver::rom_needs_driver() {
+            installed = true;
+            step("Installing the USB driver for the ST bootloader (Windows asks for permission)...");
+            driver::install_elevated()?;
         }
         if t0.elapsed() > wait {
-            return Err("the bootloader (USB 0483:DF11) did not show up".into());
+            return Err("no bootloader showed up (USB 1209:0002 or 0483:DF11)".into());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -210,8 +284,14 @@ pub fn flash(img: &Image, report: &dyn Fn(Progress)) {
     let step = |f: f32, s: &str| report(Progress::Step(f, s.to_string()));
     let r = (|| -> Result<String, String> {
         step(0.0, "Waiting for the bootloader...");
-        let d = open(Duration::from_secs(10))?;
+        let (d, ours) = open(Duration::from_secs(10), &|s| step(0.0, s))?;
         d.to_idle()?;
+        if ours {
+            return flash_boot(&d, img, &step);
+        }
+        if img.addr != FLASH_BASE {
+            return Err("this board has no sutterspeed bootloader yet: it needs the whole image (sutterspeed.hex)".into());
+        }
 
         // pad to a multiple of 8 bytes (flash is programmed in double words)
         let mut data = img.data.clone();
@@ -239,7 +319,23 @@ pub fn flash(img: &Image, report: &dyn Fn(Progress)) {
         }
         step(0.99, "Starting the new firmware...");
         d.leave();
-        Ok(format!("Done: {} bytes written and verified (0x{:08X})", data.len(), img.addr))
+        Ok(format!("Done: {} bytes written and verified (0x{:08X}, ST bootloader)", data.len(), img.addr))
     })();
     report(Progress::Done(r));
+}
+
+/// our bootloader: the firmware in 2 KB blocks (it erases, writes and reads back), then start it
+fn flash_boot(d: &Dfu, img: &Image, step: &dyn Fn(f32, &str)) -> Result<String, String> {
+    let app = img.app().ok_or("this file has no firmware for the sutterspeed bootloader (0.4.0 or newer needed)")?;
+    let blocks: Vec<&[u8]> = app.chunks(BOOT_BLOCK).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        step(0.02 + 0.93 * i as f32 / blocks.len() as f32, &format!("Writing 0x{:08X}", FLASH_BASE + APP_OFFSET + (i * BOOT_BLOCK) as u32));
+        d.out(DNLOAD, i as u16, b)?;
+        d.wait()?;
+    }
+    step(0.97, "Starting the new firmware...");
+    d.out(DNLOAD, blocks.len() as u16, &[])?; // end of the download: the bootloader checks and completes the firmware
+    d.wait_manifest()?;
+    let _ = d.out(DETACH, 0, &[]); // restart into the firmware
+    Ok(format!("Done: {} bytes written and verified (sutterspeed bootloader)", app.len()))
 }

@@ -10,12 +10,12 @@
 #include "scope.h"
 #include "tusb.h"
 
-#define FW_VERSION "0.3.8"
+#define FW_VERSION "0.4.0"
 #include <math.h>
 
 extern volatile uint32_t acq_overruns, acq_isr_us_max, acq_isr_us_last, acq_isr_calls;
 uint32_t millis(void);
-void request_bootloader(void);
+void request_bootloader(bool rom);
 
 /* ---------------------------------------------------------------- output */
 /* queue text for the host; bulk data leaves it unflushed so it goes out in full 64-byte packets */
@@ -227,7 +227,7 @@ static void exec(char *line) {
          "  zero          cover the sensor first: learn dark offsets\r\n"
          "  gain          self-calibrated stage gains\r\n"
          "  adc [scans]   raw channel statistics and stage ratios (default 65536 scans)\r\n"
-         "  dfu           reboot into the ST USB DFU bootloader (firmware update)\r\n"
+         "  dfu [rom]     reboot into the USB bootloader for a firmware update (rom: the ST one)\r\n"
          "  ver           firmware version and interrupt load\r\n");
   } else if (!strcmp(line, "lux")) {
     if (arg && !strcmp(arg, "on")) lux_stream = true;
@@ -255,7 +255,7 @@ static void exec(char *line) {
     outs("rebooting into DFU...\r\n");
     uint32_t t0 = millis();
     while (millis() - t0 < 100) tud_task();
-    request_bootloader();
+    request_bootloader(arg && !strcmp(arg, "rom"));
   } else if (!strcmp(line, "ver")) {
     outf("sutterspeed fw " FW_VERSION "  scan %sus  overruns %lu  isr %lu/%lu us (budget 1280)  calls %lu\r\n",
          fx(a, DT_US, 2), (unsigned long)acq_overruns, (unsigned long)acq_isr_us_last, (unsigned long)acq_isr_us_max,

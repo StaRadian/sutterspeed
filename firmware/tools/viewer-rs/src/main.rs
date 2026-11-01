@@ -9,6 +9,7 @@
 #![windows_subsystem = "windows"]
 
 mod dfu;
+mod driver;
 mod github;
 mod icons;
 mod knob;
@@ -426,7 +427,7 @@ impl App {
         let img_copy = dfu::Image { addr: img.addr, data: img.data.clone() };
         self.upd.image = Some(Ok(img));
         if self.connected.is_some() {
-            self.send("dfu"); // the board restarts into the ST USB bootloader
+            self.send("dfu"); // the board restarts into its USB bootloader
             self.want_conn = false;
             self.ctl(Ctl::Disconnect);
         } else if !dfu::dfu_present() {
@@ -780,6 +781,9 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--flash") {
         std::process::exit(flash_cli(args.get(i + 1)));
+    }
+    if args.iter().any(|a| a == "--install-driver") {
+        std::process::exit(driver::install_now()); // started elevated by driver::install_elevated
     }
     if args.iter().any(|a| a == "--update") {
         std::process::exit(update_cli());
