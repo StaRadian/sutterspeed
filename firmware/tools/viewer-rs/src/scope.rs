@@ -249,6 +249,7 @@ pub struct ScopeView {
     #[allow(clippy::type_complexity)]
     vis_cache: std::cell::RefCell<Option<((u64, u64, u64, bool, u8, usize, usize), std::rc::Rc<(Vec<f64>, Vec<f64>, Vec<f64>)>, Option<Option<std::rc::Rc<Meas>>>)>>,
     trig_on: bool, // trigger on: frames aligned on the trigger; off: the live (rolling) stream
+    trig_resume: Option<u8>, // trigger switched off by turning into the roll range: its mode, back on when the time base returns
     maxp_s: f64, // pulse mode: longest pulse
     pulse: PulseView,
     dec_manual: Option<u32>, // sample = mean of this many scans, set by hand (None = from the time base)
@@ -300,6 +301,7 @@ impl ScopeView {
             data_ver: 0,
             vis_cache: Default::default(),
             trig_on: false,
+            trig_resume: None,
             maxp_s: 40.0,
             pulse: PulseView::default(),
             dec_manual: None,
@@ -361,12 +363,27 @@ impl ScopeView {
         self.window() < ROLL_FROM
     }
 
-    /// Trigger ON in the roll range (the time base was turned there): switch it off, back to AUTO.
+    /// Trigger ON in the roll range (the time base was turned there): switch it off, back to AUTO, and remember it.
+    /// Turning back to a time base with a trigger switches it on again, in the mode it had.
     fn drop_trigger_if_rolling(&mut self, out: &mut Vec<String>) {
-        if self.trig_on && !self.pulse_mode && !self.trig_possible() {
-            self.trig_on = false;
-            self.mode = 0;
+        if self.pulse_mode {
+            return;
+        }
+        if self.trig_on {
+            self.trig_resume = None;
+            if !self.trig_possible() {
+                self.trig_resume = Some(self.mode);
+                self.trig_on = false;
+                self.mode = 0;
+                self.running = true;
+                self.apply(out);
+            }
+        } else if let Some(m) = self.trig_resume.filter(|_| self.trig_possible()) {
+            self.trig_resume = None;
+            self.trig_on = true;
+            self.mode = m;
             self.running = true;
+            self.clamp_delay();
             self.apply(out);
         }
     }
@@ -927,6 +944,7 @@ impl ScopeView {
                         if !self.trig_on {
                             self.mode = 0; // without a trigger only AUTO (free running) makes sense
                             self.running = true;
+                            self.trig_resume = None; // switched off by hand: stays off
                         }
                     }
                     });
@@ -1520,4 +1538,36 @@ fn level_only(a: &str, b: &str) -> bool {
         && a.len() > 9
         && a[9] == "0"
         && a.iter().zip(&b).enumerate().all(|(i, (x, y))| i == 5 || i == 6 || x == y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the trigger switched off by the roll range comes back (in its mode) with a faster time base; switched off by
+    /// hand it stays off
+    #[test]
+    fn trigger_back_after_roll_range() {
+        let mut s = ScopeView::new();
+        let mut out = Vec::new();
+        s.trig_on = true;
+        s.mode = 1; // NORMAL
+        s.tdiv_v = 50e-3;
+        s.drop_trigger_if_rolling(&mut out);
+        assert!(!s.trig_on && s.mode == 0);
+        s.tdiv_v = 100e-3;
+        s.drop_trigger_if_rolling(&mut out);
+        assert!(!s.trig_on);
+        s.tdiv_v = 5e-3;
+        s.drop_trigger_if_rolling(&mut out);
+        assert!(s.trig_on && s.mode == 1);
+
+        s.trig_on = false; // off by hand (the ON / OFF button clears trig_resume)
+        s.trig_resume = None;
+        s.tdiv_v = 50e-3;
+        s.drop_trigger_if_rolling(&mut out);
+        s.tdiv_v = 5e-3;
+        s.drop_trigger_if_rolling(&mut out);
+        assert!(!s.trig_on);
+    }
 }
