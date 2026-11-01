@@ -37,7 +37,8 @@ through it or SWD.
 - From the viewer: chip icon → *Update from GitHub* or pick the `.hex`, or `sutterspeed-viewer --flash build/sutterspeed.hex`.
   The board restarts into its bootloader (`dfu` command) and the firmware part of the image is written over USB.
   Boards without the bootloader (firmware before 0.4.0) restart into the ST bootloader and get the whole image.
-  A blank chip should start the ST bootloader by itself (empty-flash check, not tried yet), so it is written the same way.
+  A blank chip starts the ST bootloader by itself (empty-flash check, factory option bytes), so it is written the
+  same way: plug it in, then *Update from GitHub* or `--flash`.
   When the ST bootloader has no driver on the PC, the viewer binds Windows' own WinUSB to it
   (it restarts itself as administrator once: `--install-driver`, Windows asks for permission).
 - ST-LINK V3 + Tag-Connect TC2030-CTX-NL-STDC14 on J2:
