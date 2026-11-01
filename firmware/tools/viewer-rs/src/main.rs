@@ -556,6 +556,7 @@ impl App {
         let mut start = false;
         let mut pick = false;
         let mut github = false;
+        let mut builtin = false;
         let mut restart = false;
         egui::Window::new("Update")
             .collapsible(false)
@@ -580,6 +581,16 @@ impl App {
                 for (err, t) in &self.upd.gh_log {
                     ui.label(if *err { RichText::new(t).color(Color32::from_rgb(220, 70, 60)) } else { RichText::new(t) });
                 }
+                ui.separator();
+                // ---- the firmware inside this viewer: no internet needed (blank boards too)
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(format!("Write built-in firmware {}", env!("CARGO_PKG_VERSION"))))
+                        .on_hover_text("Writes the firmware that came with this viewer (no internet needed), also to a blank board")
+                        .clicked()
+                    {
+                        builtin = true;
+                    }
+                });
                 ui.separator();
                 // ---- from a file
                 ui.label("Or write a firmware file (.hex / .bin) over USB. No ST-LINK needed.");
@@ -637,6 +648,12 @@ impl App {
         }
         if github {
             self.start_github(ctx);
+        }
+        if builtin {
+            self.upd.image = Some(dfu::builtin());
+            self.upd.path = Some(std::path::PathBuf::from(format!("built-in firmware {}", env!("CARGO_PKG_VERSION"))));
+            self.upd.result = None;
+            self.start_update(ctx);
         }
         if restart {
             if let Ok(exe) = std::env::current_exe() {
@@ -706,13 +723,13 @@ impl eframe::App for App {
     }
 }
 
-/// `sutterspeed-viewer --flash firmware.hex`: update without the window (for scripts)
+/// `sutterspeed-viewer --flash [firmware.hex]`: update without the window (for scripts); no file = the built-in firmware
 fn flash_cli(path: Option<&String>) -> i32 {
-    let Some(path) = path else {
-        println!("usage: sutterspeed-viewer --flash <firmware.hex|bin>");
-        return 2;
+    let img = match path.filter(|p| !p.starts_with("--")) {
+        Some(p) => dfu::load(std::path::Path::new(p)),
+        None => dfu::builtin(),
     };
-    let img = match dfu::load(std::path::Path::new(path)) {
+    let img = match img {
         Ok(i) => i,
         Err(e) => {
             println!("error: {e}");

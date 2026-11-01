@@ -55,10 +55,12 @@ board and pick its COM port.
   is newer and replaces the viewer when it is newer (restart to use it). Firmware goes over USB through the board's
   own bootloader, which needs no driver; no STM32CubeProgrammer needed. Older boards (before 0.4.0) and blank chips
   are written through the ST bootloader; if the PC has no driver for it, the viewer installs Windows' own WinUSB
-  (one Windows permission prompt). A `.hex`/`.bin` file can be written too. From a script:
-  `sutterspeed-viewer --flash sutterspeed.hex`, `sutterspeed-viewer --update` (viewer only).
+  (one Windows permission prompt). *Write built-in firmware* writes the firmware that comes inside the viewer
+  (no internet needed, blank boards too); a `.hex`/`.bin` file can be written as well. From a script:
+  `sutterspeed-viewer --flash [sutterspeed.hex]` (no file: the built-in one), `sutterspeed-viewer --update` (viewer only).
 
-Build: `cd firmware/tools/viewer-rs && cargo build --release`.
+Build: the firmware first (`firmware/build/sutterspeed.hex` goes into the viewer), then
+`cd firmware/tools/viewer-rs && cargo build --release`.
 
 ## Firmware
 

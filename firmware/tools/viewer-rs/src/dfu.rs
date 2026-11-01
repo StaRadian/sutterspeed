@@ -47,6 +47,13 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
+/// the firmware of this viewer's release (build/sutterspeed.hex at build time: build the firmware first)
+const BUILTIN_HEX: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/sutterspeed.hex"));
+
+pub fn builtin() -> Result<Image, String> {
+    load_bytes(BUILTIN_HEX.to_vec(), true)
+}
+
 pub fn load(path: &std::path::Path) -> Result<Image, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read the file: {e}"))?;
     let is_hex = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("hex"));
